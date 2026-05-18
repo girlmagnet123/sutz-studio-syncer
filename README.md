@@ -22,3 +22,20 @@ It can:
 - Receive `patchScript` messages and apply source through `ScriptEditorService`.
 
 The daemon is next.
+
+## Local Command
+
+Install dependencies and register the local `sutz` command:
+
+```powershell
+npm install
+npm link
+```
+
+Then start the daemon with:
+
+```powershell
+sutz
+```
+
+For development, `npm run dev` still runs the TypeScript source directly.
