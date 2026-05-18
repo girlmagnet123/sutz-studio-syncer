@@ -21,7 +21,12 @@ It can:
 - Send script, instance, and removal messages.
 - Receive `patchScript` messages and apply source through `ScriptEditorService`.
 
-The daemon is next.
+The daemon can:
+
+- Start a local WebSocket server on `127.0.0.1:8181`.
+- Create a `sync` folder in the project where `sutz` is run.
+- Write Studio script snapshots into `sync`.
+- Update or remove synced script files when Studio sends changes.
 
 ## Local Command
 
@@ -35,6 +40,13 @@ npm link
 Then start the daemon with:
 
 ```powershell
+sutz
+```
+
+By default, `sutz` writes generated Studio scripts to `./sync`. To use a different folder:
+
+```powershell
+$env:SUTZ_SYNC_DIR = "my-sync-folder"
 sutz
 ```
 

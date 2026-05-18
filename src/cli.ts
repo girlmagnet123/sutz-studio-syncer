@@ -3,12 +3,13 @@ import { SutzDaemon } from "./daemon.js";
 
 const port = Number(process.env.SUTZ_PORT ?? 8181);
 const host = process.env.SUTZ_HOST ?? "127.0.0.1";
+const syncDir = process.env.SUTZ_SYNC_DIR ?? "sync";
 
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error(`Invalid SUTZ_PORT: ${process.env.SUTZ_PORT}`);
 }
 
-const daemon = new SutzDaemon({ host, port });
+const daemon = new SutzDaemon({ host, port, syncDir });
 
 try {
   await daemon.start();

@@ -1,5 +1,7 @@
 import { createServer, type Server } from "node:http";
+import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
+import { FileWriter } from "./fileWriter.js";
 import {
   ClientMessageType,
   ServerMessageType,
@@ -11,6 +13,7 @@ import {
 export interface DaemonOptions {
   port: number;
   host: string;
+  syncDir: string;
 }
 
 export class SutzDaemon {
@@ -20,16 +23,20 @@ export class SutzDaemon {
   private socketServer: WebSocketServer | null = null;
   private studioClient: WebSocket | null = null;
   private instances = new Map<string, StudioInstanceRecord>();
+  private fileWriter: FileWriter;
 
   public constructor(options: DaemonOptions) {
     this.port = options.port;
     this.host = options.host;
+    this.fileWriter = new FileWriter({ rootDir: options.syncDir });
   }
 
   public async start(): Promise<void> {
     if (this.httpServer || this.socketServer) {
       return;
     }
+
+    this.fileWriter.ensureRoot();
 
     this.httpServer = createServer((_, response) => {
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -54,6 +61,7 @@ export class SutzDaemon {
     });
 
     console.log(`Sutz daemon listening on ws://${this.host}:${this.port}`);
+    console.log(`Sync folder: ${path.relative(process.cwd(), this.fileWriter.getRootDir()) || "."}`);
   }
 
   public async stop(): Promise<void> {
@@ -137,27 +145,37 @@ export class SutzDaemon {
         for (const instance of message.instances) {
           this.instances.set(instance.guid, instance);
         }
+        {
+          const written = this.fileWriter.writeSnapshot(message.instances);
+          console.log(`Wrote ${written} script file(s) to sync folder.`);
+        }
         console.log(`Snapshot received: ${message.instances.length} instances.`);
         break;
 
       case ClientMessageType.ScriptChanged:
-        this.instances.set(message.guid, {
-          guid: message.guid,
-          className: message.className,
-          name: message.path[message.path.length - 1] ?? "Script",
-          path: message.path,
-          source: message.source,
-        });
+        {
+          const instance = {
+            guid: message.guid,
+            className: message.className,
+            name: message.path[message.path.length - 1] ?? "Script",
+            path: message.path,
+            source: message.source,
+          };
+          this.instances.set(message.guid, instance);
+          this.fileWriter.writeScript(instance);
+        }
         console.log(`Script changed: ${message.path.join("/")}`);
         break;
 
       case ClientMessageType.InstanceChanged:
         this.instances.set(message.instance.guid, message.instance);
+        this.fileWriter.writeScript(message.instance);
         console.log(`Instance changed: ${message.instance.path.join("/")}`);
         break;
 
       case ClientMessageType.InstanceRemoved:
         this.instances.delete(message.guid);
+        this.fileWriter.remove(message.guid);
         console.log(`Instance removed: ${message.guid}`);
         break;
 
