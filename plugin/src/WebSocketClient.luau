@@ -32,15 +32,17 @@ function WebSocketClient:onError(callback)
 end
 
 function WebSocketClient:connect()
-	if type(WebSocket) ~= "table" or type(WebSocket.connect) ~= "function" then
+	if type(HttpService.CreateWebStreamClient) ~= "function" then
 		for _, callback in ipairs(self.errorHandlers) do
-			callback("WebSocket API is unavailable in this Studio session")
+			callback("HttpService:CreateWebStreamClient is unavailable in this Studio session")
 		end
 		return false
 	end
 
 	local ok, socketOrError = pcall(function()
-		return WebSocket.connect(self.url)
+		return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
+			Url = self.url,
+		})
 	end)
 
 	if not ok then
@@ -70,12 +72,18 @@ function WebSocketClient:connect()
 		end
 	end)
 
-	self.socket.Closed:Connect(function()
-		self.connected = false
-		for _, callback in ipairs(self.closeHandlers) do
-			callback()
-		end
+	local hasClosedSignal, closedSignal = pcall(function()
+		return self.socket.Closed
 	end)
+
+	if hasClosedSignal and closedSignal then
+		closedSignal:Connect(function()
+			self.connected = false
+			for _, callback in ipairs(self.closeHandlers) do
+				callback()
+			end
+		end)
+	end
 
 	return true
 end
