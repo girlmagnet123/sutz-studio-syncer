@@ -45,8 +45,12 @@ export class SutzDaemon {
       this.handleConnection(socket);
     });
 
-    await new Promise<void>((resolve) => {
-      this.httpServer!.listen(this.port, this.host, resolve);
+    await new Promise<void>((resolve, reject) => {
+      this.httpServer!.once("error", reject);
+      this.httpServer!.listen(this.port, this.host, () => {
+        this.httpServer!.off("error", reject);
+        resolve();
+      });
     });
 
     console.log(`Sutz daemon listening on ws://${this.host}:${this.port}`);

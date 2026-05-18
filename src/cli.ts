@@ -10,7 +10,18 @@ if (!Number.isInteger(port) || port <= 0) {
 
 const daemon = new SutzDaemon({ host, port });
 
-await daemon.start();
+try {
+  await daemon.start();
+} catch (error) {
+  if (isNodeError(error) && error.code === "EADDRINUSE") {
+    console.error(
+      `Port ${host}:${port} is already in use. Stop the existing daemon or set SUTZ_PORT to another port.`,
+    );
+    process.exit(1);
+  }
+
+  throw error;
+}
 
 let stopping = false;
 const stop = async (signal: string): Promise<void> => {
@@ -31,3 +42,7 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   void stop("SIGTERM");
 });
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
