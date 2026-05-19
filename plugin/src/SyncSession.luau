@@ -129,6 +129,7 @@ function SyncSession:applyPatch(message)
 	self.applyingPatch = false
 
 	if ok then
+		warn(string.format("{Sutz Syncer} Updated: {%s}", instance:GetFullName()))
 		debugLog("Patched script:", instance:GetFullName())
 	else
 		warn("[Sutz Syncer] Failed to patch script:", err)

@@ -74,7 +74,7 @@ export class FileWriter {
     return this.rootDir;
   }
 
-  private getFilePath(instance: StudioInstanceRecord): string {
+  public getFilePath(instance: StudioInstanceRecord): string {
     const parentSegments = instance.path.slice(0, -1).map((segment) => {
       return this.sanitizeSegment(segment);
     });

@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import fs from "node:fs";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { FileWriter } from "./fileWriter.js";
@@ -24,6 +25,10 @@ export class SutzDaemon {
   private studioClient: WebSocket | null = null;
   private instances = new Map<string, StudioInstanceRecord>();
   private fileWriter: FileWriter;
+  private fileWatcher: fs.FSWatcher | null = null;
+  private readonly guidToFilePath = new Map<string, string>();
+  private readonly filePathToGuid = new Map<string, string>();
+  private readonly pendingFileTimers = new Map<string, NodeJS.Timeout>();
 
   public constructor(options: DaemonOptions) {
     this.port = options.port;
@@ -37,6 +42,7 @@ export class SutzDaemon {
     }
 
     this.fileWriter.ensureRoot();
+    this.startFileWatcher();
 
     this.httpServer = createServer((_, response) => {
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -66,6 +72,7 @@ export class SutzDaemon {
 
   public async stop(): Promise<void> {
     this.send({ type: ServerMessageType.Disconnect });
+    this.stopFileWatcher();
 
     if (this.studioClient) {
       this.studioClient.close();
@@ -142,11 +149,14 @@ export class SutzDaemon {
 
       case ClientMessageType.Snapshot:
         this.instances.clear();
+        this.guidToFilePath.clear();
+        this.filePathToGuid.clear();
         for (const instance of message.instances) {
           this.instances.set(instance.guid, instance);
         }
         {
           const written = this.fileWriter.writeSnapshot(message.instances);
+          this.indexSyncedScripts(message.instances);
           console.log(`Wrote ${written} script file(s) to sync folder.`);
         }
         console.log(`Snapshot received: ${message.instances.length} instances.`);
@@ -154,6 +164,7 @@ export class SutzDaemon {
 
       case ClientMessageType.ScriptChanged:
         {
+          const previousFilePath = this.guidToFilePath.get(message.guid);
           const instance = {
             guid: message.guid,
             className: message.className,
@@ -163,19 +174,28 @@ export class SutzDaemon {
           };
           this.instances.set(message.guid, instance);
           this.fileWriter.writeScript(instance);
+          this.indexSyncedScript(instance, previousFilePath);
         }
         console.log(`Script changed: ${message.path.join("/")}`);
         break;
 
       case ClientMessageType.InstanceChanged:
-        this.instances.set(message.instance.guid, message.instance);
-        this.fileWriter.writeScript(message.instance);
+        {
+          const previousFilePath = this.guidToFilePath.get(message.instance.guid);
+          this.instances.set(message.instance.guid, message.instance);
+          if (this.fileWriter.writeScript(message.instance)) {
+            this.indexSyncedScript(message.instance, previousFilePath);
+          } else {
+            this.forgetSyncedScript(message.instance.guid);
+          }
+        }
         console.log(`Instance changed: ${message.instance.path.join("/")}`);
         break;
 
       case ClientMessageType.InstanceRemoved:
         this.instances.delete(message.guid);
         this.fileWriter.remove(message.guid);
+        this.forgetSyncedScript(message.guid);
         console.log(`Instance removed: ${message.guid}`);
         break;
 
@@ -191,5 +211,144 @@ export class SutzDaemon {
 
     this.studioClient.send(JSON.stringify(message));
     return true;
+  }
+
+  private startFileWatcher(): void {
+    if (this.fileWatcher) {
+      return;
+    }
+
+    try {
+      this.fileWatcher = fs.watch(
+        this.fileWriter.getRootDir(),
+        { recursive: true },
+        (_, fileName) => {
+          if (!fileName) {
+            return;
+          }
+
+          this.scheduleFilePatch(
+            path.join(this.fileWriter.getRootDir(), fileName.toString()),
+          );
+        },
+      );
+
+      this.fileWatcher.on("error", (error) => {
+        console.warn("Sync folder watcher error:", error);
+      });
+    } catch (error) {
+      console.warn("Could not watch sync folder for local edits:", error);
+    }
+  }
+
+  private stopFileWatcher(): void {
+    if (this.fileWatcher) {
+      this.fileWatcher.close();
+      this.fileWatcher = null;
+    }
+
+    for (const timer of this.pendingFileTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFileTimers.clear();
+  }
+
+  private scheduleFilePatch(filePath: string): void {
+    const normalizedPath = this.normalizeFilePath(filePath);
+
+    if (!this.filePathToGuid.has(normalizedPath)) {
+      return;
+    }
+
+    const existingTimer = this.pendingFileTimers.get(normalizedPath);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingFileTimers.delete(normalizedPath);
+      this.patchStudioFromFile(normalizedPath);
+    }, 120);
+
+    this.pendingFileTimers.set(normalizedPath, timer);
+  }
+
+  private patchStudioFromFile(filePath: string): void {
+    const guid = this.filePathToGuid.get(filePath);
+    if (!guid) {
+      return;
+    }
+
+    const instance = this.instances.get(guid);
+    if (!instance) {
+      this.forgetSyncedScript(guid);
+      return;
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return;
+    }
+
+    const source = fs.readFileSync(filePath, "utf8");
+    if (instance.source === source) {
+      return;
+    }
+
+    const sent = this.send({
+      type: ServerMessageType.PatchScript,
+      guid,
+      source,
+    });
+
+    if (!sent) {
+      console.warn(
+        `Local edit detected, but no Studio client is connected: ${path.relative(process.cwd(), filePath)}`,
+      );
+      return;
+    }
+
+    instance.source = source;
+    console.log(`Patched Studio script from file: ${path.relative(process.cwd(), filePath)}`);
+  }
+
+  private indexSyncedScripts(instances: StudioInstanceRecord[]): void {
+    for (const instance of instances) {
+      this.indexSyncedScript(instance);
+    }
+  }
+
+  private indexSyncedScript(instance: StudioInstanceRecord, previousFilePath?: string): void {
+    if (!this.isScript(instance) || typeof instance.source !== "string") {
+      this.forgetSyncedScript(instance.guid);
+      return;
+    }
+
+    if (previousFilePath) {
+      this.filePathToGuid.delete(this.normalizeFilePath(previousFilePath));
+    }
+
+    const filePath = this.normalizeFilePath(this.fileWriter.getFilePath(instance));
+    this.guidToFilePath.set(instance.guid, filePath);
+    this.filePathToGuid.set(filePath, instance.guid);
+  }
+
+  private forgetSyncedScript(guid: string): void {
+    const filePath = this.guidToFilePath.get(guid);
+    if (filePath) {
+      this.filePathToGuid.delete(filePath);
+    }
+    this.guidToFilePath.delete(guid);
+  }
+
+  private normalizeFilePath(filePath: string): string {
+    return path.normalize(path.resolve(filePath));
+  }
+
+  private isScript(instance: StudioInstanceRecord): boolean {
+    return (
+      instance.className === "Script" ||
+      instance.className === "LocalScript" ||
+      instance.className === "ModuleScript"
+    );
   }
 }
