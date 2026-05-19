@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -199,6 +200,10 @@ export class SutzDaemon {
         console.log(`Instance removed: ${message.guid}`);
         break;
 
+      case ClientMessageType.CopyToClipboard:
+        void this.copyToClipboard(message.text);
+        break;
+
       case ClientMessageType.Pong:
         break;
     }
@@ -351,4 +356,81 @@ export class SutzDaemon {
       instance.className === "ModuleScript"
     );
   }
+
+  private async copyToClipboard(text: string): Promise<void> {
+    if (text.length === 0) {
+      return;
+    }
+
+    try {
+      await writeClipboardText(text);
+      console.log("Copied selected Studio path(s) to clipboard.");
+    } catch (error) {
+      console.warn("Could not copy selected Studio path(s) to clipboard:", error);
+    }
+  }
+}
+
+interface ClipboardCommand {
+  command: string;
+  args: string[];
+}
+
+function getClipboardCommands(): ClipboardCommand[] {
+  if (process.platform === "win32") {
+    return [{ command: "cmd.exe", args: ["/d", "/s", "/c", "clip"] }];
+  }
+
+  if (process.platform === "darwin") {
+    return [{ command: "pbcopy", args: [] }];
+  }
+
+  return [
+    { command: "wl-copy", args: [] },
+    { command: "xclip", args: ["-selection", "clipboard"] },
+    { command: "xsel", args: ["--clipboard", "--input"] },
+  ];
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  const commands = getClipboardCommands();
+  let lastError: unknown = null;
+
+  for (const command of commands) {
+    try {
+      await runClipboardCommand(command, text);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError ?? new Error("No clipboard command is available.");
+}
+
+function runClipboardCommand(command: ClipboardCommand, text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command.command, command.args, {
+      stdio: ["pipe", "ignore", "pipe"],
+      windowsHide: true,
+    });
+
+    let stderr = "";
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderr.trim() || `${command.command} exited with ${code}`));
+      }
+    });
+
+    child.stdin.end(text);
+  });
 }

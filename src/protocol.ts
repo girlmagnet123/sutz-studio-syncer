@@ -4,6 +4,7 @@ export const ClientMessageType = {
   ScriptChanged: "scriptChanged",
   InstanceChanged: "instanceChanged",
   InstanceRemoved: "instanceRemoved",
+  CopyToClipboard: "copyToClipboard",
   Pong: "pong",
 } as const;
 
@@ -47,6 +48,10 @@ export type ClientMessage =
   | {
       type: typeof ClientMessageType.InstanceRemoved;
       guid: string;
+    }
+  | {
+      type: typeof ClientMessageType.CopyToClipboard;
+      text: string;
     }
   | {
       type: typeof ClientMessageType.Pong;

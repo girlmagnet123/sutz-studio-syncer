@@ -1,8 +1,12 @@
 --!nonstrict
 
+local Selection = game:GetService("Selection")
+local StudioService = game:GetService("StudioService")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local Config = require(script.Parent.Config)
+local Protocol = require(script.Parent.Protocol)
 
 local UI = {}
 UI.__index = UI
@@ -169,6 +173,56 @@ local function applyServiceText(text)
 	Config.SYNC_SERVICES = nextServices
 end
 
+local function isIdentifier(value)
+	return string.match(value, "^[%a_][%w_]*$") ~= nil
+end
+
+local function quoteSegment(value)
+	return string.format("%q", value)
+end
+
+local function formatPathSegment(value, isFirst)
+	if isIdentifier(value) then
+		return isFirst and value or "." .. value
+	end
+
+	return "[" .. quoteSegment(value) .. "]"
+end
+
+local function getInstancePath(instance)
+	local segments = {}
+	local current = instance
+
+	while current and current ~= game do
+		table.insert(segments, 1, current.Name)
+		current = current.Parent
+	end
+
+	if current ~= game or #segments == 0 then
+		return nil
+	end
+
+	local path = ""
+	for index, segment in ipairs(segments) do
+		path ..= formatPathSegment(segment, index == 1)
+	end
+
+	return path
+end
+
+local function getSelectedPaths()
+	local paths = {}
+
+	for _, instance in ipairs(Selection:Get()) do
+		local path = getInstancePath(instance)
+		if path then
+			table.insert(paths, path)
+		end
+	end
+
+	return paths
+end
+
 function UI.new(plugin, pluginScript, session)
 	local self = setmetatable({}, UI)
 	self.plugin = plugin
@@ -180,6 +234,7 @@ function UI.new(plugin, pluginScript, session)
 	self.pages = {}
 	self.pageScales = {}
 	self.navButtons = {}
+	self.connections = {}
 
 	self.widget = self:createWidget()
 	self:createContents()
@@ -382,6 +437,10 @@ function UI:createSettingsPage()
 		Enum.Font.Gotham
 	)
 	hint.Size = UDim2.new(1, 0, 0, 44)
+
+	local misc = self:makePanel(page, "Misc", 3)
+	self.copyPathButton = makeButton(misc, "Copy Path", COLORS.panelSoft)
+	self.copyPathButton.Size = UDim2.new(1, 0, 0, 32)
 end
 
 function UI:createOutputPage()
@@ -450,9 +509,9 @@ function UI:tryAttachFusionScale(scale)
 end
 
 function UI:wire()
-	self.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	table.insert(self.connections, self.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 		self:onVisibilityChanged()
-	end)
+	end))
 
 	self.connectButton.MouseButton1Click:Connect(function()
 		self:toggleConnection()
@@ -498,11 +557,62 @@ function UI:wire()
 		self:setStatus(Config.DEBUG and "Debug logging enabled" or "Debug logging disabled", COLORS.muted)
 	end)
 
+	self.copyPathButton.MouseButton1Click:Connect(function()
+		self:copySelectedPaths()
+	end)
+
 	self.serviceField.FocusLost:Connect(function()
 		applyServiceText(self.serviceField.Text)
 		self.serviceField.Text = joinServices()
 		self:setStatus("Service list updated", COLORS.success)
 	end)
+
+	table.insert(self.connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed or input.KeyCode ~= Enum.KeyCode.C then
+			return
+		end
+
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt) then
+			self:copySelectedPaths()
+		end
+	end))
+end
+
+function UI:copySelectedPaths()
+	local paths = getSelectedPaths()
+
+	if #paths == 0 then
+		self:setStatus("Select something first", COLORS.danger)
+		self.outputLabel.Text = "Select one or more instances in Explorer or the viewport, then copy their paths."
+		return
+	end
+
+	local text = table.concat(paths, "\n")
+	local ok, err = pcall(function()
+		StudioService:CopyToClipboard(text)
+	end)
+
+	if not ok then
+		local sentToDaemon = self.session:isRunning() and self.session:send({
+			type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
+			text = text,
+		})
+
+		if sentToDaemon then
+			self:setStatus("Sent paths to daemon clipboard", COLORS.success)
+			self.outputLabel.Text = text
+			return
+		end
+
+		self:setStatus("Clipboard copy failed", COLORS.danger)
+		self.outputLabel.Text = "Could not access Studio clipboard API. Connect to the daemon and try again.\n" .. text
+		warn("[Sutz Syncer] Failed to copy selected path(s):", err)
+		return
+	end
+
+	local suffix = #paths == 1 and "path" or "paths"
+	self:setStatus(string.format("Copied %d %s", #paths, suffix), COLORS.success)
+	self.outputLabel.Text = text
 end
 
 function UI:switchPage(name, animated)
@@ -597,6 +707,11 @@ function UI:destroy()
 	if self.session then
 		self.session:stop()
 	end
+
+	for _, connection in ipairs(self.connections) do
+		connection:Disconnect()
+	end
+	self.connections = {}
 
 	if self.fusionCleanup then
 		local ok, Fusion = pcall(require, self.pluginScript.Fusion)

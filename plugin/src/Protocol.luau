@@ -8,6 +8,7 @@ Protocol.ClientMessage = {
 	SCRIPT_CHANGED = "scriptChanged",
 	INSTANCE_CHANGED = "instanceChanged",
 	INSTANCE_REMOVED = "instanceRemoved",
+	COPY_TO_CLIPBOARD = "copyToClipboard",
 	PONG = "pong",
 }
 
