@@ -224,6 +224,14 @@ local function getSelectedPaths()
 	return paths
 end
 
+local function isCopyPathShortcut(input)
+	if input.KeyCode ~= Enum.KeyCode.C then
+		return false
+	end
+
+	return UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+end
+
 function UI.new(plugin, pluginScript, session)
 	local self = setmetatable({}, UI)
 	self.plugin = plugin
@@ -568,14 +576,12 @@ function UI:wire()
 		self:setStatus("Service list updated", COLORS.success)
 	end)
 
-	table.insert(self.connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if gameProcessed or input.KeyCode ~= Enum.KeyCode.C then
+	table.insert(self.connections, UserInputService.InputBegan:Connect(function(input)
+		if not isCopyPathShortcut(input) or UserInputService:GetFocusedTextBox() then
 			return
 		end
 
-		if UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt) then
-			self:copySelectedPaths()
-		end
+		self:copySelectedPaths()
 	end))
 end
 
