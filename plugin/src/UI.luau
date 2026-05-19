@@ -1,7 +1,6 @@
 --!nonstrict
 
 local Selection = game:GetService("Selection")
-local StudioService = game:GetService("StudioService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
@@ -588,25 +587,14 @@ function UI:copySelectedPaths()
 	end
 
 	local text = table.concat(paths, "\n")
-	local ok, err = pcall(function()
-		StudioService:CopyToClipboard(text)
-	end)
+	local sentToDaemon = self.session:isRunning() and self.session:send({
+		type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
+		text = text,
+	})
 
-	if not ok then
-		local sentToDaemon = self.session:isRunning() and self.session:send({
-			type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
-			text = text,
-		})
-
-		if sentToDaemon then
-			self:setStatus("Sent paths to daemon clipboard", COLORS.success)
-			self.outputLabel.Text = text
-			return
-		end
-
-		self:setStatus("Clipboard copy failed", COLORS.danger)
-		self.outputLabel.Text = "Could not access Studio clipboard API. Connect to the daemon and try again.\n" .. text
-		warn("[Sutz Syncer] Failed to copy selected path(s):", err)
+	if not sentToDaemon then
+		self:setStatus("Connect daemon first", COLORS.danger)
+		self.outputLabel.Text = "Run `sutz`, connect the plugin, then copy again.\n" .. text
 		return
 	end
 
