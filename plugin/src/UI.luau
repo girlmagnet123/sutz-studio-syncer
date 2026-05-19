@@ -6,6 +6,7 @@ local UserInputService = game:GetService("UserInputService")
 
 local Config = require(script.Parent.Config)
 local Protocol = require(script.Parent.Protocol)
+local WebSocketClient = require(script.Parent.WebSocketClient)
 
 local UI = {}
 UI.__index = UI
@@ -587,20 +588,40 @@ function UI:copySelectedPaths()
 	end
 
 	local text = table.concat(paths, "\n")
-	local sentToDaemon = self.session:isRunning() and self.session:send({
-		type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
-		text = text,
-	})
+	local copied = self:copyTextWithDaemon(text)
 
-	if not sentToDaemon then
-		self:setStatus("Connect daemon first", COLORS.danger)
-		self.outputLabel.Text = "Run `sutz`, connect the plugin, then copy again.\n" .. text
+	if not copied then
+		self:setStatus("Start daemon first", COLORS.danger)
+		self.outputLabel.Text = "Run `sutz`, then copy again.\n" .. text
 		return
 	end
 
 	local suffix = #paths == 1 and "path" or "paths"
 	self:setStatus(string.format("Copied %d %s", #paths, suffix), COLORS.success)
 	self.outputLabel.Text = text
+end
+
+function UI:copyTextWithDaemon(text)
+	local message = {
+		type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
+		text = text,
+	}
+
+	if self.session:isRunning() then
+		return self.session:send(message)
+	end
+
+	local client = WebSocketClient.new(Config.WS_URL)
+	if not client:connect() then
+		return false
+	end
+
+	local sent = client:send(message)
+	task.delay(0.15, function()
+		client:close()
+	end)
+
+	return sent
 end
 
 function UI:switchPage(name, animated)
