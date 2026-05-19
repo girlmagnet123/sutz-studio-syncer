@@ -1,5 +1,6 @@
 --!nonstrict
 
+local HttpService = game:GetService("HttpService")
 local Selection = game:GetService("Selection")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -588,11 +589,11 @@ function UI:copySelectedPaths()
 	end
 
 	local text = table.concat(paths, "\n")
-	local copied = self:copyTextWithDaemon(text)
+	local copied, errorMessage = self:copyTextWithDaemon(text)
 
 	if not copied then
-		self:setStatus("Start daemon first", COLORS.danger)
-		self.outputLabel.Text = "Run `sutz`, then copy again.\n" .. text
+		self:setStatus("Clipboard copy failed", COLORS.danger)
+		self.outputLabel.Text = (errorMessage or "Run `sutz`, then copy again.") .. "\n" .. text
 		return
 	end
 
@@ -602,26 +603,64 @@ function UI:copySelectedPaths()
 end
 
 function UI:copyTextWithDaemon(text)
-	local message = {
-		type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
-		text = text,
-	}
-
-	if self.session:isRunning() then
-		return self.session:send(message)
-	end
-
+	local requestId = HttpService:GenerateGUID(false)
+	local resultEvent = Instance.new("BindableEvent")
 	local client = WebSocketClient.new(Config.WS_URL)
-	if not client:connect() then
-		return false
+	local finished = false
+
+	local function finish(ok, errorMessage)
+		if finished then
+			return
+		end
+
+		finished = true
+		resultEvent:Fire(ok, errorMessage)
 	end
 
-	local sent = client:send(message)
-	task.delay(0.15, function()
-		client:close()
+	client:onMessage(function(message)
+		if
+			type(message) == "table"
+			and message.type == Protocol.ServerMessage.CLIPBOARD_RESULT
+			and message.requestId == requestId
+		then
+			finish(message.ok == true, message.error)
+		end
 	end)
 
-	return sent
+	client:onClose(function()
+		finish(false, "Connection closed before clipboard confirmation.")
+	end)
+
+	client:onError(function(err)
+		finish(false, tostring(err))
+	end)
+
+	if not client:connect() then
+		resultEvent:Destroy()
+		return false, "Could not connect to `sutz`. Run `sutz`, then copy again."
+	end
+
+	local sent = client:send({
+		type = Protocol.ClientMessage.COPY_TO_CLIPBOARD,
+		text = text,
+		requestId = requestId,
+	})
+
+	if not sent then
+		client:close()
+		resultEvent:Destroy()
+		return false, "Could not send clipboard request to `sutz`."
+	end
+
+	task.delay(2, function()
+		finish(false, "Timed out waiting for clipboard confirmation.")
+	end)
+
+	local ok, errorMessage = resultEvent.Event:Wait()
+	client:close()
+	resultEvent:Destroy()
+
+	return ok, errorMessage
 end
 
 function UI:switchPage(name, animated)

@@ -11,6 +11,7 @@ export const ClientMessageType = {
 export const ServerMessageType = {
   RequestSnapshot: "requestSnapshot",
   PatchScript: "patchScript",
+  ClipboardResult: "clipboardResult",
   Ping: "ping",
   Disconnect: "disconnect",
 } as const;
@@ -52,6 +53,7 @@ export type ClientMessage =
   | {
       type: typeof ClientMessageType.CopyToClipboard;
       text: string;
+      requestId?: string;
     }
   | {
       type: typeof ClientMessageType.Pong;
@@ -65,6 +67,12 @@ export type ServerMessage =
       type: typeof ServerMessageType.PatchScript;
       guid: string;
       source: string;
+    }
+  | {
+      type: typeof ServerMessageType.ClipboardResult;
+      ok: boolean;
+      requestId?: string;
+      error?: string;
     }
   | {
       type: typeof ServerMessageType.Ping;

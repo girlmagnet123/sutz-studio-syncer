@@ -102,24 +102,17 @@ export class SutzDaemon {
   }
 
   private handleConnection(socket: WebSocket): void {
-    if (this.studioClient) {
-      console.warn("Replacing existing Studio connection.");
-      this.studioClient.close();
-    }
-
-    this.studioClient = socket;
-    console.log("Studio connected.");
-    this.send({ type: ServerMessageType.RequestSnapshot });
+    console.log("Client connected.");
 
     socket.on("message", (raw) => {
-      this.handleRawMessage(raw.toString());
+      this.handleRawMessage(socket, raw.toString());
     });
 
     socket.on("close", () => {
       if (this.studioClient === socket) {
         this.studioClient = null;
+        console.log("Studio disconnected.");
       }
-      console.log("Studio disconnected.");
     });
 
     socket.on("error", (error) => {
@@ -127,7 +120,7 @@ export class SutzDaemon {
     });
   }
 
-  private handleRawMessage(raw: string): void {
+  private handleRawMessage(socket: WebSocket, raw: string): void {
     let message: ClientMessage;
 
     try {
@@ -137,12 +130,20 @@ export class SutzDaemon {
       return;
     }
 
-    this.handleMessage(message);
+    this.handleMessage(socket, message);
   }
 
-  private handleMessage(message: ClientMessage): void {
+  private handleMessage(socket: WebSocket, message: ClientMessage): void {
     switch (message.type) {
       case ClientMessageType.Hello:
+        if (this.studioClient && this.studioClient !== socket) {
+          console.warn("Replacing existing Studio connection.");
+          this.studioClient.close();
+        }
+
+        this.studioClient = socket;
+        console.log("Studio connected.");
+        this.sendTo(socket, { type: ServerMessageType.RequestSnapshot });
         console.log(
           `Studio hello: ${message.client} protocol v${message.protocolVersion}`,
         );
@@ -201,7 +202,7 @@ export class SutzDaemon {
         break;
 
       case ClientMessageType.CopyToClipboard:
-        void this.copyToClipboard(message.text);
+        void this.copyToClipboard(socket, message.text, message.requestId);
         break;
 
       case ClientMessageType.Pong:
@@ -214,7 +215,15 @@ export class SutzDaemon {
       return false;
     }
 
-    this.studioClient.send(JSON.stringify(message));
+    return this.sendTo(this.studioClient, message);
+  }
+
+  private sendTo(socket: WebSocket, message: ServerMessage): boolean {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    socket.send(JSON.stringify(message));
     return true;
   }
 
@@ -357,16 +366,33 @@ export class SutzDaemon {
     );
   }
 
-  private async copyToClipboard(text: string): Promise<void> {
+  private async copyToClipboard(socket: WebSocket, text: string, requestId?: string): Promise<void> {
     if (text.length === 0) {
+      this.sendTo(socket, {
+        type: ServerMessageType.ClipboardResult,
+        ok: false,
+        requestId,
+        error: "No text was provided.",
+      });
       return;
     }
 
     try {
       await writeClipboardText(text);
       console.log("Copied selected Studio path(s) to clipboard.");
+      this.sendTo(socket, {
+        type: ServerMessageType.ClipboardResult,
+        ok: true,
+        requestId,
+      });
     } catch (error) {
       console.warn("Could not copy selected Studio path(s) to clipboard:", error);
+      this.sendTo(socket, {
+        type: ServerMessageType.ClipboardResult,
+        ok: false,
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 }
@@ -378,7 +404,7 @@ interface ClipboardCommand {
 
 function getClipboardCommands(): ClipboardCommand[] {
   if (process.platform === "win32") {
-    return [{ command: "cmd.exe", args: ["/d", "/s", "/c", "clip"] }];
+    return [{ command: "clip.exe", args: [] }];
   }
 
   if (process.platform === "darwin") {
