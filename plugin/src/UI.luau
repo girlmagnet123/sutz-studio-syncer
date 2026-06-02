@@ -1,6 +1,7 @@
 --!nonstrict
 
 local HttpService = game:GetService("HttpService")
+local InsertService = game:GetService("InsertService")
 local Selection = game:GetService("Selection")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -244,6 +245,7 @@ function UI.new(plugin, pluginScript, session)
 	self.pageScales = {}
 	self.navButtons = {}
 	self.connections = {}
+	self.statusTween = nil
 
 	self.widget = self:createWidget()
 	self:createContents()
@@ -450,6 +452,13 @@ function UI:createSettingsPage()
 	local misc = self:makePanel(page, "Misc", 3)
 	self.copyPathButton = makeButton(misc, "Copy Path", COLORS.panelSoft)
 	self.copyPathButton.Size = UDim2.new(1, 0, 0, 32)
+
+	makeText(misc, "AssetIdLabel", "Asset ID", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
+		UDim2.new(1, 0, 0, 18)
+	self.assetIdField = makeField(misc, "")
+	self.assetIdField.PlaceholderText = "Enter an asset id..."
+	self.loadAssetButton = makeButton(misc, "Load Asset", COLORS.accent)
+	self.loadAssetButton.Size = UDim2.new(1, 0, 0, 32)
 end
 
 function UI:createOutputPage()
@@ -570,6 +579,16 @@ function UI:wire()
 		self:copySelectedPaths()
 	end)
 
+	self.loadAssetButton.MouseButton1Click:Connect(function()
+		self:loadAsset()
+	end)
+
+	self.assetIdField.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			self:loadAsset()
+		end
+	end)
+
 	self.serviceField.FocusLost:Connect(function()
 		applyServiceText(self.serviceField.Text)
 		self.serviceField.Text = joinServices()
@@ -606,6 +625,32 @@ function UI:copySelectedPaths()
 	local suffix = #paths == 1 and "path" or "paths"
 	self:setStatus(string.format("Copied %d %s", #paths, suffix), COLORS.success)
 	self.outputLabel.Text = text
+end
+
+function UI:loadAsset()
+	local raw = string.gsub(self.assetIdField.Text, "%s", "")
+	local assetId = tonumber(raw)
+
+	if not assetId then
+		self:setStatus("Enter a valid asset id", COLORS.danger)
+		self.outputLabel.Text = "Asset ID must be a number. Example: 123456789"
+		return
+	end
+
+	local ok, result = pcall(function()
+		return InsertService:LoadAsset(assetId)
+	end)
+
+	if not ok then
+		self:setStatus("Asset load failed", COLORS.danger)
+		self.outputLabel.Text = string.format("Could not load asset %d:\n%s", assetId, tostring(result))
+		self:switchPage("Output", true)
+		return
+	end
+
+	result.Parent = game.Workspace
+	self:setStatus("Asset loaded", COLORS.success)
+	self.outputLabel.Text = string.format("Loaded asset %d into Workspace.", assetId)
 end
 
 function UI:copyTextWithDaemon(text)
@@ -753,8 +798,13 @@ function UI:updateConnectionVisuals()
 end
 
 function UI:setStatus(text, color)
+	if self.statusTween then
+		self.statusTween:Cancel()
+		self.statusTween = nil
+	end
+
 	self.statusLabel.Text = text
-	tween(self.statusLabel, { TextColor3 = color or COLORS.muted }, 0.12)
+	self.statusTween = tween(self.statusLabel, { TextColor3 = color or COLORS.muted }, 0.12)
 end
 
 function UI:destroy()
