@@ -12,6 +12,7 @@ local WebSocketClient = require(script.Parent.WebSocketClient)
 
 local UI = {}
 UI.__index = UI
+local WS_URL_SETTING = "SutzStudioSyncer_WsUrl"
 
 local COLORS = {
 	background = Color3.fromRGB(22, 24, 29),
@@ -247,12 +248,30 @@ function UI.new(plugin, pluginScript, session)
 	self.connections = {}
 	self.statusTween = nil
 
+	self:loadSavedSettings()
+
 	self.widget = self:createWidget()
 	self:createContents()
 	self:wire()
 	self:switchPage("Overview", false)
 
 	return self
+end
+
+function UI:loadSavedSettings()
+	local ok, saved = pcall(function()
+		return self.plugin:GetSetting(WS_URL_SETTING)
+	end)
+
+	if ok and type(saved) == "string" and saved ~= "" then
+		Config.WS_URL = saved
+	end
+end
+
+function UI:saveUrl(url)
+	pcall(function()
+		self.plugin:SetSetting(WS_URL_SETTING, url)
+	end)
 end
 
 function UI:createWidget()
@@ -563,6 +582,7 @@ function UI:wire()
 		if value ~= "" then
 			Config.WS_URL = value
 			self.overviewUriLabel.Text = value
+			self:saveUrl(value)
 			self:setStatus("URI updated", COLORS.success)
 		else
 			self.urlField.Text = Config.WS_URL
@@ -770,8 +790,13 @@ function UI:toggleConnection()
 		self:setStatus("Disconnected", COLORS.muted)
 		self.outputLabel.Text = "The daemon connection is closed."
 	else
-		Config.WS_URL = self.urlField.Text
+		local value = string.gsub(self.urlField.Text, "^%s*(.-)%s*$", "%1")
+		if value ~= "" then
+			Config.WS_URL = value
+		end
+		self.urlField.Text = Config.WS_URL
 		self.overviewUriLabel.Text = Config.WS_URL
+		self:saveUrl(Config.WS_URL)
 		self:setStatus("Connecting...", COLORS.accentSoft)
 		local connected = self.session:start()
 		if connected then
