@@ -1,9 +1,10 @@
 --!nonstrict
 
+
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
+local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
-local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
 local Config = require(script.Parent.Config)
@@ -12,21 +13,24 @@ local WebSocketClient = require(script.Parent.WebSocketClient)
 
 local UI = {}
 UI.__index = UI
+
 local WS_URL_SETTING = "SutzStudioSyncer_WsUrl"
+local ICON = "rbxassetid://117603874582847"
 
 local COLORS = {
-	background = Color3.fromRGB(22, 24, 29),
-	panel = Color3.fromRGB(31, 34, 42),
-	panelSoft = Color3.fromRGB(39, 43, 52),
-	field = Color3.fromRGB(45, 49, 60),
-	fieldFocused = Color3.fromRGB(54, 60, 74),
-	border = Color3.fromRGB(68, 75, 92),
-	text = Color3.fromRGB(242, 245, 251),
-	muted = Color3.fromRGB(164, 172, 190),
-	accent = Color3.fromRGB(86, 139, 255),
-	accentSoft = Color3.fromRGB(116, 165, 255),
-	success = Color3.fromRGB(83, 202, 142),
-	danger = Color3.fromRGB(213, 88, 110),
+	bg = Color3.fromRGB(9, 9, 12),
+	bgStreak = Color3.fromRGB(58, 66, 92),
+	panel = Color3.fromRGB(18, 19, 24),
+	panelSoft = Color3.fromRGB(27, 29, 37),
+	field = Color3.fromRGB(21, 23, 29),
+	fieldFocused = Color3.fromRGB(30, 33, 43),
+	border = Color3.fromRGB(48, 52, 66),
+	text = Color3.fromRGB(238, 241, 248),
+	muted = Color3.fromRGB(150, 158, 176),
+	accent = Color3.fromRGB(96, 139, 255),
+	accentSoft = Color3.fromRGB(140, 176, 255),
+	success = Color3.fromRGB(78, 205, 145),
+	danger = Color3.fromRGB(224, 92, 116),
 }
 
 local SERVICES = {
@@ -40,12 +44,106 @@ local SERVICES = {
 	"StarterPlayer",
 }
 
-local function tween(instance, properties, duration)
-	local info = TweenInfo.new(duration or 0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local animation = TweenService:Create(instance, info, properties)
-	animation:Play()
-	return animation
+
+local BUTTON_FONT = Font.new("rbxasset://fonts/families/FingerPaint.json")
+
+
+local function resolveFusion(pluginScript)
+	local candidates = {
+		script.Parent and script.Parent:FindFirstChild("Fusion") or nil,
+		pluginScript and pluginScript:FindFirstChild("Fusion") or nil,
+		script:FindFirstChild("Fusion"),
+	}
+
+	for _, mod in ipairs(candidates) do
+		if mod then
+			local ok, fusion = pcall(require, mod)
+			if ok then
+				return fusion
+			end
+			warn("[Sutz Syncer] Found Fusion but failed to require it:", fusion)
+		end
+	end
+
+	error("[Sutz Syncer] Fusion ModuleScript not found. Place 'Fusion' next to Main or UI.")
 end
+
+
+
+local function isIdentifier(value)
+	return string.match(value, "^[%a_][%w_]*$") ~= nil
+end
+
+local function quoteSegment(value)
+	return string.format("%q", value)
+end
+
+local function formatPathSegment(value, isFirst)
+	if isIdentifier(value) then
+		return isFirst and value or "." .. value
+	end
+	return "[" .. quoteSegment(value) .. "]"
+end
+
+local function getInstancePath(instance)
+	local segments = {}
+	local current = instance
+
+	while current and current ~= game do
+		table.insert(segments, 1, current.Name)
+		current = current.Parent
+	end
+
+	if current ~= game or #segments == 0 then
+		return nil
+	end
+
+	local path = ""
+	for index, segment in ipairs(segments) do
+		path ..= formatPathSegment(segment, index == 1)
+	end
+	return path
+end
+
+local function getSelectedPaths()
+	local paths = {}
+	for _, instance in ipairs(Selection:Get()) do
+		local path = getInstancePath(instance)
+		if path then
+			table.insert(paths, path)
+		end
+	end
+	return paths
+end
+
+local function isCopyPathShortcut(input)
+	if input.KeyCode ~= Enum.KeyCode.C then
+		return false
+	end
+	return UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+end
+
+local function joinServices()
+	local enabled = {}
+	for _, name in ipairs(SERVICES) do
+		if Config.SYNC_SERVICES[name] then
+			table.insert(enabled, name)
+		end
+	end
+	return table.concat(enabled, ", ")
+end
+
+local function applyServiceText(text)
+	local nextServices = {}
+	for item in string.gmatch(text, "([^,]+)") do
+		local serviceName = string.gsub(item, "^%s*(.-)%s*$", "%1")
+		if serviceName ~= "" then
+			nextServices[serviceName] = true
+		end
+	end
+	Config.SYNC_SERVICES = nextServices
+end
+
 
 local function corner(parent, radius)
 	local item = Instance.new("UICorner")
@@ -88,213 +186,70 @@ local function makeText(parent, name, text, size, color, font)
 	return label
 end
 
--- Finger Paint font for button labels. Font.new never errors on a bad path; if
--- the family is unavailable Studio just falls back to the default font.
-local BUTTON_FONT = Font.new("rbxasset://fonts/families/FingerPaint.json")
+local function makePanel(parent, titleText, order)
+	local panel = Instance.new("Frame")
+	panel.Name = titleText
+	panel.BackgroundColor3 = COLORS.panel
+	panel.BorderSizePixel = 0
+	panel.AutomaticSize = Enum.AutomaticSize.Y
+	panel.Size = UDim2.new(1, 0, 0, 0)
+	panel.LayoutOrder = order
+	panel.Parent = parent
+	corner(panel, 10)
+	stroke(panel, COLORS.border, 0.5)
+	padding(panel, 12)
 
--- Buttons render their text as two stacked labels (a black shadow under a white
--- label), so updating their caption has to touch both. Use this for any button
--- whose text changes at runtime.
-local function setButtonText(button, text)
-	local label = button:FindFirstChild("Label")
-	local shadow = button:FindFirstChild("TextShadow")
+	local panelGradient = Instance.new("UIGradient")
+	panelGradient.Color = ColorSequence.new(Color3.fromRGB(30, 33, 42), Color3.fromRGB(18, 19, 25))
+	panelGradient.Rotation = 90
+	panelGradient.Parent = panel
 
-	if label then
-		label.Text = text
-	end
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = panel
 
-	if shadow then
-		shadow.Text = text
-	end
+	local title = makeText(panel, "SectionTitle", titleText, 13, COLORS.text, Enum.Font.GothamBold)
+	title.Size = UDim2.new(1, 0, 0, 18)
+
+	return panel
 end
 
-local function makeButton(parent, text, backgroundColor)
-	local button = Instance.new("TextButton")
-	button.AutoButtonColor = false
-	button.BackgroundColor3 = backgroundColor or COLORS.accent
-	button.BorderSizePixel = 0
-	button.Text = ""
-	button.Size = UDim2.new(1, 0, 0, 36)
-	button.Parent = parent
-	corner(button, 7)
 
-	local shadow = Instance.new("TextLabel")
-	shadow.Name = "TextShadow"
-	shadow.BackgroundTransparency = 1
-	shadow.FontFace = BUTTON_FONT
-	shadow.Text = text
-	shadow.TextColor3 = Color3.fromRGB(0, 0, 0)
-	shadow.TextTransparency = 0.35
-	shadow.TextSize = 16
-	shadow.Size = UDim2.fromScale(1, 1)
-	shadow.Position = UDim2.fromOffset(2, 2)
-	shadow.ZIndex = 2
-	shadow.Parent = button
-
-	local label = Instance.new("TextLabel")
-	label.Name = "Label"
-	label.BackgroundTransparency = 1
-	label.FontFace = BUTTON_FONT
-	label.Text = text
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.TextSize = 16
-	label.Size = UDim2.fromScale(1, 1)
-	label.ZIndex = 3
-	label.Parent = button
-
-	local scale = Instance.new("UIScale")
-	scale.Scale = 1
-	scale.Parent = button
-
-	button.MouseEnter:Connect(function()
-		tween(button, {
-			BackgroundColor3 = backgroundColor == COLORS.danger and Color3.fromRGB(231, 103, 124) or COLORS.accentSoft,
-		})
-		tween(scale, { Scale = 1.015 }, 0.12)
-	end)
-
-	button.MouseLeave:Connect(function()
-		tween(button, { BackgroundColor3 = backgroundColor or COLORS.accent })
-		tween(scale, { Scale = 1 }, 0.12)
-	end)
-
-	button.MouseButton1Down:Connect(function()
-		tween(scale, { Scale = 0.985 }, 0.08)
-	end)
-
-	button.MouseButton1Up:Connect(function()
-		tween(scale, { Scale = 1.015 }, 0.08)
-	end)
-
-	return button
-end
-
-local function makeField(parent, text)
-	local box = Instance.new("TextBox")
-	box.BackgroundColor3 = COLORS.field
-	box.BorderSizePixel = 0
-	box.ClearTextOnFocus = false
-	box.Font = Enum.Font.Code
-	box.PlaceholderColor3 = Color3.fromRGB(118, 128, 146)
-	box.Text = text or ""
-	box.TextColor3 = COLORS.text
-	box.TextSize = 13
-	box.TextXAlignment = Enum.TextXAlignment.Left
-	box.Size = UDim2.new(1, 0, 0, 32)
-	box.Parent = parent
-	corner(box, 6)
-	padding(box, 8)
-
-	box.Focused:Connect(function()
-		tween(box, { BackgroundColor3 = COLORS.fieldFocused }, 0.12)
-	end)
-
-	box.FocusLost:Connect(function()
-		tween(box, { BackgroundColor3 = COLORS.field }, 0.12)
-	end)
-
-	return box
-end
-
-local function joinServices()
-	local enabled = {}
-	for _, name in ipairs(SERVICES) do
-		if Config.SYNC_SERVICES[name] then
-			table.insert(enabled, name)
-		end
-	end
-	return table.concat(enabled, ", ")
-end
-
-local function applyServiceText(text)
-	local nextServices = {}
-	for item in string.gmatch(text, "([^,]+)") do
-		local serviceName = string.gsub(item, "^%s*(.-)%s*$", "%1")
-		if serviceName ~= "" then
-			nextServices[serviceName] = true
-		end
-	end
-	Config.SYNC_SERVICES = nextServices
-end
-
-local function isIdentifier(value)
-	return string.match(value, "^[%a_][%w_]*$") ~= nil
-end
-
-local function quoteSegment(value)
-	return string.format("%q", value)
-end
-
-local function formatPathSegment(value, isFirst)
-	if isIdentifier(value) then
-		return isFirst and value or "." .. value
-	end
-
-	return "[" .. quoteSegment(value) .. "]"
-end
-
-local function getInstancePath(instance)
-	local segments = {}
-	local current = instance
-
-	while current and current ~= game do
-		table.insert(segments, 1, current.Name)
-		current = current.Parent
-	end
-
-	if current ~= game or #segments == 0 then
-		return nil
-	end
-
-	local path = ""
-	for index, segment in ipairs(segments) do
-		path ..= formatPathSegment(segment, index == 1)
-	end
-
-	return path
-end
-
-local function getSelectedPaths()
-	local paths = {}
-
-	for _, instance in ipairs(Selection:Get()) do
-		local path = getInstancePath(instance)
-		if path then
-			table.insert(paths, path)
-		end
-	end
-
-	return paths
-end
-
-local function isCopyPathShortcut(input)
-	if input.KeyCode ~= Enum.KeyCode.C then
-		return false
-	end
-
-	return UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
-end
 
 function UI.new(plugin, pluginScript, session)
 	local self = setmetatable({}, UI)
 	self.plugin = plugin
 	self.pluginScript = pluginScript
 	self.session = session
-	self.fusionCleanup = nil
-	self.panelScaleGoal = nil
 	self.activePage = "Overview"
-	self.pages = {}
-	self.pageScales = {}
-	self.navButtons = {}
 	self.connections = {}
-	self.statusTween = nil
 
 	self:loadSavedSettings()
 
+	local Fusion = resolveFusion(pluginScript)
+	self.Fusion = Fusion
+	local scope = Fusion:scoped()
+	self.scope = scope
+
+	self.state = {
+		activePage = scope:Value("Overview"),
+		statusText = scope:Value("Idle"),
+		statusColor = scope:Value(COLORS.muted),
+		connected = scope:Value(false),
+		debug = scope:Value(Config.DEBUG),
+		streakT = scope:Value(0), 
+		pulse = scope:Value(0), 
+		entrance = scope:Value(0.95), 
+	}
+
 	self.widget = self:createWidget()
-	self:createContents()
+	self:build()
 	self:wire()
-	self:switchPage("Overview", false)
+	self:startAmbient()
+	self:switchPage("Overview")
+	self:updateConnectionVisuals()
 
 	return self
 end
@@ -303,7 +258,6 @@ function UI:loadSavedSettings()
 	local ok, saved = pcall(function()
 		return self.plugin:GetSetting(WS_URL_SETTING)
 	end)
-
 	if ok and type(saved) == "string" and saved ~= "" then
 		Config.WS_URL = saved
 	end
@@ -321,325 +275,643 @@ function UI:createWidget()
 		false,
 		false,
 		400,
-		500,
+		520,
 		330,
 		360
 	)
-
 	local widget = self.plugin:CreateDockWidgetPluginGui("SutzStudioSyncerWidget", info)
 	widget.Title = "Sutz Studio Syncer"
 	return widget
 end
 
-function UI:createContents()
-	local root = Instance.new("Frame")
-	root.Name = "Root"
-	root.BackgroundColor3 = COLORS.background
-	root.BorderSizePixel = 0
-	root.Size = UDim2.fromScale(1, 1)
+
+
+function UI:build()
+	local scope = self.scope
+	local Fusion = self.Fusion
+	local state = self.state
+
+	local function New(class)
+		return scope:New(class)
+	end
+	local function Value(v)
+		return scope:Value(v)
+	end
+	local function Computed(fn)
+		return scope:Computed(fn)
+	end
+	local function Spring(goal, speed, damping)
+		return scope:Spring(goal, speed, damping)
+	end
+	local Children = Fusion.Children
+	local OnEvent = Fusion.OnEvent
+
+	local function hoverTint(c)
+		return c:Lerp(Color3.new(1, 1, 1), 0.14)
+	end
+
+	
+	local function Button(props)
+		local hovered = Value(false)
+		local pressed = Value(false)
+		local base = props.baseColor or COLORS.accent
+
+		local scaleSpring = Spring(
+			Computed(function(use)
+				if use(pressed) then
+					return 0.97
+				elseif use(hovered) then
+					return 1.03
+				end
+				return 1
+			end),
+			34,
+			0.7
+		)
+
+		local colorSpring = Spring(
+			Computed(function(use)
+				local c = use(base)
+				return if use(hovered) then hoverTint(c) else c
+			end),
+			26,
+			1
+		)
+
+		local glowStroke = Spring(
+			Computed(function(use)
+				return if use(hovered) then 0.15 else 1
+			end),
+			26,
+			1
+		)
+
+		return New("TextButton") {
+			Name = props.name or "Button",
+			AutoButtonColor = false,
+			BackgroundColor3 = colorSpring,
+			BorderSizePixel = 0,
+			Text = "",
+			Size = props.size or UDim2.new(1, 0, 0, 38),
+			LayoutOrder = props.order,
+			[OnEvent("MouseEnter")] = function()
+				hovered:set(true)
+			end,
+			[OnEvent("MouseLeave")] = function()
+				hovered:set(false)
+				pressed:set(false)
+			end,
+			[OnEvent("MouseButton1Down")] = function()
+				pressed:set(true)
+			end,
+			[OnEvent("MouseButton1Up")] = function()
+				pressed:set(false)
+			end,
+			[Children] = {
+				New("UICorner") { CornerRadius = UDim.new(0, 8) },
+				New("UIScale") { Scale = scaleSpring },
+				New("UIStroke") {
+					Color = COLORS.accentSoft,
+					Thickness = 1.4,
+					Transparency = glowStroke,
+					ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				},
+				New("TextLabel") {
+					Name = "Label",
+					BackgroundTransparency = 1,
+					FontFace = BUTTON_FONT,
+					Text = props.text or "",
+					TextColor3 = props.textColor or Color3.fromRGB(255, 255, 255),
+					TextSize = 16,
+					Size = UDim2.fromScale(1, 1),
+					ZIndex = 2,
+					[Children] = {
+						New("UIStroke") {
+							Color = Color3.fromRGB(0, 0, 0),
+							Thickness = 1.6,
+							Transparency = 0.25,
+							ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual,
+							LineJoinMode = Enum.LineJoinMode.Round,
+						},
+					},
+				},
+			},
+		}
+	end
+
+	
+	local function NavTab(name, order)
+		local hovered = Value(false)
+		local isActive = Computed(function(use)
+			return use(state.activePage) == name
+		end)
+
+		local bg = Spring(
+			Computed(function(use)
+				if use(isActive) then
+					return COLORS.accent
+				elseif use(hovered) then
+					return hoverTint(COLORS.panelSoft)
+				end
+				return COLORS.panelSoft
+			end),
+			28,
+			1
+		)
+		local txt = Spring(
+			Computed(function(use)
+				if use(isActive) then
+					return Color3.fromRGB(255, 255, 255)
+				elseif use(hovered) then
+					return COLORS.text
+				end
+				return COLORS.muted
+			end),
+			28,
+			1
+		)
+		local scl = Spring(
+			Computed(function(use)
+				return if use(hovered) then 1.02 else 1
+			end),
+			30,
+			0.7
+		)
+
+		local tab = New("TextButton") {
+			Name = name .. "Tab",
+			AutoButtonColor = false,
+			BackgroundColor3 = bg,
+			BorderSizePixel = 0,
+			Font = Enum.Font.GothamBold,
+			Text = name,
+			TextColor3 = txt,
+			TextSize = 13,
+			Size = UDim2.new(1 / 3, -4, 1, 0),
+			LayoutOrder = order,
+			[OnEvent("MouseEnter")] = function()
+				hovered:set(true)
+			end,
+			[OnEvent("MouseLeave")] = function()
+				hovered:set(false)
+			end,
+			[Children] = {
+				New("UICorner") { CornerRadius = UDim.new(0, 6) },
+				New("UIScale") { Scale = scl },
+			},
+		}
+
+		tab.MouseButton1Click:Connect(function()
+			self:switchPage(name, true)
+		end)
+		return tab
+	end
+
+
+	local function Field(parent, text, placeholder)
+		local focused = Value(false)
+
+		local box = New("TextBox") {
+			BackgroundColor3 = Spring(
+				Computed(function(use)
+					return if use(focused) then COLORS.fieldFocused else COLORS.field
+				end),
+				26,
+				1
+			),
+			BorderSizePixel = 0,
+			ClearTextOnFocus = false,
+			Font = Enum.Font.Code,
+			PlaceholderColor3 = Color3.fromRGB(110, 118, 138),
+			PlaceholderText = placeholder or "",
+			Text = text or "",
+			TextColor3 = COLORS.text,
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, 0, 0, 32),
+			[OnEvent("Focused")] = function()
+				focused:set(true)
+			end,
+			[OnEvent("FocusLost")] = function()
+				focused:set(false)
+			end,
+			[Children] = {
+				New("UICorner") { CornerRadius = UDim.new(0, 6) },
+				New("UIPadding") {
+					PaddingLeft = UDim.new(0, 8),
+					PaddingRight = UDim.new(0, 8),
+					PaddingTop = UDim.new(0, 6),
+					PaddingBottom = UDim.new(0, 6),
+				},
+				New("UIStroke") {
+					Color = COLORS.accent,
+					Thickness = 1.2,
+					Transparency = Spring(
+						Computed(function(use)
+							return if use(focused) then 0.25 else 0.75
+						end),
+						26,
+						1
+					),
+				},
+			},
+		}
+		box.Parent = parent
+		return box
+	end
+
+
+	local function makePage(name)
+		local isActive = Computed(function(use)
+			return use(state.activePage) == name
+		end)
+		local scaleSpring = Spring(
+			Computed(function(use)
+				return if use(isActive) then 1 else 0.96
+			end),
+			30,
+			0.82
+		)
+
+		local page = New("ScrollingFrame") {
+			Name = name .. "Page",
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Size = UDim2.fromScale(1, 1),
+			Visible = isActive,
+			Active = true,
+			CanvasSize = UDim2.new(),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			ScrollBarThickness = 5,
+			ScrollBarImageColor3 = COLORS.accent,
+			ScrollBarImageTransparency = 0.35,
+			VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar,
+			ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+			TopImage = "rbxasset://textures/ui/Scroll/scroll-middle.png",
+			BottomImage = "rbxasset://textures/ui/Scroll/scroll-middle.png",
+			[Children] = {
+				New("UIScale") { Scale = scaleSpring },
+				New("UIListLayout") {
+					FillDirection = Enum.FillDirection.Vertical,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Padding = UDim.new(0, 12),
+				},
+				New("UIPadding") {
+					PaddingBottom = UDim.new(0, 6),
+					PaddingRight = UDim.new(0, 2),
+				},
+			},
+		}
+		page.Parent = self.pageHost
+		return page
+	end
+
+
+	local rootScale = Spring(state.entrance, 22, 0.8)
+
+	local streakOffset = Computed(function(use)
+		return Vector2.new((use(state.streakT) - 0.5) * 0.85, 0)
+	end)
+
+	local root = New("Frame") {
+		Name = "Root",
+		BackgroundColor3 = COLORS.bg,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Size = UDim2.fromScale(1, 1),
+		[Children] = {
+			New("UIScale") { Scale = rootScale },
+			New("UIGradient") {
+				Color = ColorSequence.new(Color3.fromRGB(20, 21, 27), Color3.fromRGB(7, 7, 10)),
+				Rotation = 90,
+			},
+	
+			New("Frame") {
+				Name = "Streaks",
+				BackgroundColor3 = COLORS.bgStreak,
+				BorderSizePixel = 0,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromScale(1.6, 1.6),
+				ZIndex = 0,
+				[Children] = {
+					New("UIGradient") {
+						Rotation = 24,
+						Offset = streakOffset,
+						Transparency = NumberSequence.new({
+							NumberSequenceKeypoint.new(0, 1),
+							NumberSequenceKeypoint.new(0.26, 1),
+							NumberSequenceKeypoint.new(0.32, 0.62),
+							NumberSequenceKeypoint.new(0.38, 1),
+							NumberSequenceKeypoint.new(0.63, 1),
+							NumberSequenceKeypoint.new(0.69, 0.72),
+							NumberSequenceKeypoint.new(0.75, 1),
+							NumberSequenceKeypoint.new(1, 1),
+						}),
+					},
+				},
+			},
+		},
+	}
 	root.Parent = self.widget
 	self.root = root
 
-	local rootGradient = Instance.new("UIGradient")
-	rootGradient.Color = ColorSequence.new(Color3.fromRGB(28, 31, 39), Color3.fromRGB(18, 19, 25))
-	rootGradient.Rotation = 90
-	rootGradient.Parent = root
 
-	local scale = Instance.new("UIScale")
-	scale.Scale = 1
-	scale.Parent = root
-	self.rootScale = scale
-	self:tryAttachFusionScale(scale)
+	local content = New("Frame") {
+		Name = "Content",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.fromScale(1, 1),
+		ZIndex = 2,
+		[Children] = {
+			New("UIPadding") {
+				PaddingTop = UDim.new(0, 14),
+				PaddingBottom = UDim.new(0, 14),
+				PaddingLeft = UDim.new(0, 14),
+				PaddingRight = UDim.new(0, 14),
+			},
+			New("UIListLayout") {
+				FillDirection = Enum.FillDirection.Vertical,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 12),
+			},
+		},
+	}
+	content.Parent = root
+	self.content = content
 
-	padding(root, 14)
+	local logoHover = Value(false)
+	local statusColorSpring = Spring(state.statusColor, 24, 1)
 
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Padding = UDim.new(0, 12)
-	layout.Parent = root
+	local header = New("Frame") {
+		Name = "Header",
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 58),
+		LayoutOrder = 1,
+		ZIndex = 2,
+		[Children] = {
+			New("ImageButton") {
+				Name = "Logo",
+				BackgroundColor3 = COLORS.panel,
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Image = ICON,
+				ScaleType = Enum.ScaleType.Fit,
+				Size = UDim2.fromOffset(50, 50),
+				Position = UDim2.fromOffset(0, 4),
+				[OnEvent("MouseEnter")] = function()
+					logoHover:set(true)
+				end,
+				[OnEvent("MouseLeave")] = function()
+					logoHover:set(false)
+				end,
+				[OnEvent("MouseButton1Click")] = function()
+					self:switchPage("Overview", true)
+				end,
+				[Children] = {
+					New("UICorner") { CornerRadius = UDim.new(0, 13) },
+					New("UIScale") {
+						Scale = Spring(
+							Computed(function(use)
+								return if use(logoHover) then 1.07 else 1
+							end),
+							30,
+							0.55
+						),
+					},
+					New("UIStroke") {
+						Color = COLORS.accentSoft,
+						Thickness = 1.5,
+						Transparency = Spring(
+							Computed(function(use)
+								local floor = if use(logoHover) then 0.1 else 0.55
+								return floor + 0.25 * (1 - use(state.pulse))
+							end),
+							20,
+							1
+						),
+					},
+				},
+			},
+			New("TextLabel") {
+				Name = "Title",
+				BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold,
+				Text = "Sutz Studio Syncer",
+				TextColor3 = COLORS.text,
+				TextSize = 19,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				Position = UDim2.fromOffset(62, 4),
+				Size = UDim2.new(1, -62, 0, 24),
+				[Children] = {
+					New("UIGradient") {
+						Color = ColorSequence.new(COLORS.text, COLORS.accentSoft),
+						Rotation = 16,
+						Offset = Computed(function(use)
+							return Vector2.new(use(state.streakT) * 2 - 1, 0)
+						end),
+					},
+				},
+			},
+			New("Frame") {
+				Name = "StatusGlow",
+				BackgroundColor3 = statusColorSpring,
+				BorderSizePixel = 0,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromOffset(64 + 4, 40 + 4),
+				Size = UDim2.fromOffset(18, 18),
+				ZIndex = 1,
+				BackgroundTransparency = Computed(function(use)
+					if not use(state.connected) then
+						return 1
+					end
+					return 0.45 + 0.4 * (1 - use(state.pulse))
+				end),
+				[Children] = {
+					New("UICorner") { CornerRadius = UDim.new(1, 0) },
+				},
+			},
+			New("Frame") {
+				Name = "StatusDot",
+				BackgroundColor3 = statusColorSpring,
+				BorderSizePixel = 0,
+				Size = UDim2.fromOffset(8, 8),
+				Position = UDim2.fromOffset(62, 36),
+				ZIndex = 2,
+				[Children] = {
+					New("UICorner") { CornerRadius = UDim.new(1, 0) },
+				},
+			},
+			New("TextLabel") {
+				Name = "Status",
+				BackgroundTransparency = 1,
+				Font = Enum.Font.GothamMedium,
+				Text = state.statusText,
+				TextColor3 = statusColorSpring,
+				TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				Position = UDim2.fromOffset(76, 32),
+				Size = UDim2.new(1, -76, 0, 20),
+			},
+		},
+	}
+	header.Parent = content
 
-	local header = Instance.new("Frame")
-	header.Name = "Header"
-	header.BackgroundTransparency = 1
-	header.Size = UDim2.new(1, 0, 0, 56)
-	header.LayoutOrder = 1
-	header.Parent = root
 
-	local logo = Instance.new("ImageLabel")
-	logo.Name = "Logo"
-	logo.BackgroundColor3 = COLORS.panel
-	logo.BorderSizePixel = 0
-	logo.Image = "rbxassetid://117603874582847"
-	logo.ScaleType = Enum.ScaleType.Fit
-	logo.Size = UDim2.fromOffset(48, 48)
-	logo.Position = UDim2.fromOffset(0, 4)
-	logo.Parent = header
-	corner(logo, 12)
-	stroke(logo, COLORS.border, 0.4)
+	local nav = New("Frame") {
+		Name = "Nav",
+		BackgroundColor3 = COLORS.panel,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 42),
+		LayoutOrder = 2,
+		ZIndex = 2,
+		[Children] = {
+			New("UICorner") { CornerRadius = UDim.new(0, 9) },
+			New("UIStroke") { Color = COLORS.border, Transparency = 0.5, Thickness = 1 },
+			New("UIPadding") {
+				PaddingTop = UDim.new(0, 5),
+				PaddingBottom = UDim.new(0, 5),
+				PaddingLeft = UDim.new(0, 5),
+				PaddingRight = UDim.new(0, 5),
+			},
+			New("UIListLayout") {
+				FillDirection = Enum.FillDirection.Horizontal,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 6),
+			},
+		},
+	}
+	nav.Parent = content
 
-	local title = makeText(header, "Title", "Sutz Studio Syncer", 19, COLORS.text, Enum.Font.GothamBold)
-	title.Position = UDim2.fromOffset(60, 4)
-	title.Size = UDim2.new(1, -60, 0, 24)
+	NavTab("Overview", 1).Parent = nav
+	NavTab("Settings", 2).Parent = nav
+	NavTab("Output", 3).Parent = nav
 
-	local titleGradient = Instance.new("UIGradient")
-	titleGradient.Color = ColorSequence.new(COLORS.text, COLORS.accentSoft)
-	titleGradient.Rotation = 18
-	titleGradient.Parent = title
 
-	self.statusDot = Instance.new("Frame")
-	self.statusDot.Name = "StatusDot"
-	self.statusDot.BackgroundColor3 = COLORS.muted
-	self.statusDot.BorderSizePixel = 0
-	self.statusDot.Size = UDim2.fromOffset(8, 8)
-	self.statusDot.Position = UDim2.fromOffset(60, 36)
-	self.statusDot.Parent = header
-	corner(self.statusDot, 4)
-
-	self.statusLabel = makeText(header, "Status", "Idle", 13, COLORS.muted, Enum.Font.GothamMedium)
-	self.statusLabel.Position = UDim2.fromOffset(74, 32)
-	self.statusLabel.Size = UDim2.new(1, -74, 0, 20)
-
-	self.nav = Instance.new("Frame")
-	self.nav.Name = "Nav"
-	self.nav.BackgroundColor3 = COLORS.panel
-	self.nav.BorderSizePixel = 0
-	self.nav.Size = UDim2.new(1, 0, 0, 42)
-	self.nav.LayoutOrder = 2
-	self.nav.Parent = root
-	corner(self.nav, 8)
-	stroke(self.nav, COLORS.border, 0.55)
-	padding(self.nav, 5)
-
-	local navLayout = Instance.new("UIListLayout")
-	navLayout.FillDirection = Enum.FillDirection.Horizontal
-	navLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	navLayout.Padding = UDim.new(0, 6)
-	navLayout.Parent = self.nav
-
-	self:createNavButton("Overview", 1)
-	self:createNavButton("Settings", 2)
-	self:createNavButton("Output", 3)
-
-	local pageHost = Instance.new("Frame")
-	pageHost.Name = "PageHost"
-	pageHost.BackgroundTransparency = 1
-	pageHost.Size = UDim2.new(1, 0, 1, -122)
-	pageHost.LayoutOrder = 3
-	pageHost.ClipsDescendants = true
-	pageHost.Parent = root
+	local pageHost = New("Frame") {
+		Name = "PageHost",
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, -124),
+		LayoutOrder = 3,
+		ClipsDescendants = true,
+		ZIndex = 2,
+	}
+	pageHost.Parent = content
 	self.pageHost = pageHost
 
-	self:createOverviewPage()
-	self:createSettingsPage()
-	self:createOutputPage()
-end
+	do
+		local page = makePage("Overview")
 
-function UI:createNavButton(name, order)
-	local button = Instance.new("TextButton")
-	button.Name = name .. "Tab"
-	button.AutoButtonColor = false
-	button.BackgroundColor3 = COLORS.panelSoft
-	button.BorderSizePixel = 0
-	button.Font = Enum.Font.GothamBold
-	button.Text = name
-	button.TextColor3 = COLORS.muted
-	button.TextSize = 13
-	button.Size = UDim2.new(1 / 3, -4, 1, 0)
-	button.LayoutOrder = order
-	button.Parent = self.nav
-	corner(button, 6)
+		local connectionPanel = makePanel(page, "Connection", 1)
+		local uri = makeText(connectionPanel, "Uri", Config.WS_URL, 13, COLORS.muted, Enum.Font.Code)
+		uri.Size = UDim2.new(1, 0, 0, 20)
+		self.overviewUriLabel = uri
 
-	local scale = Instance.new("UIScale")
-	scale.Scale = 1
-	scale.Parent = button
+		self.connectButton = Button({
+			name = "Connect",
+			text = Computed(function(use)
+				return if use(state.connected) then "Disconnect" else "Connect"
+			end),
+			baseColor = Computed(function(use)
+				return if use(state.connected) then COLORS.danger else COLORS.accent
+			end),
+		})
+		self.connectButton.Parent = connectionPanel
 
-	button.MouseEnter:Connect(function()
-		if self.activePage ~= name then
-			tween(button, { BackgroundColor3 = Color3.fromRGB(48, 53, 65), TextColor3 = COLORS.text }, 0.12)
-		end
-		tween(scale, { Scale = 1.015 }, 0.12)
-	end)
+		self.snapshotButton = Button({ name = "Snapshot", text = "Send Snapshot", baseColor = COLORS.panelSoft })
+		self.snapshotButton.Parent = connectionPanel
 
-	button.MouseLeave:Connect(function()
-		if self.activePage ~= name then
-			tween(button, { BackgroundColor3 = COLORS.panelSoft, TextColor3 = COLORS.muted }, 0.12)
-		end
-		tween(scale, { Scale = 1 }, 0.12)
-	end)
-
-	button.MouseButton1Click:Connect(function()
-		self:switchPage(name, true)
-	end)
-
-	self.navButtons[name] = button
-	return button
-end
-
-function UI:createPage(name)
-	local page = Instance.new("ScrollingFrame")
-	page.Name = name .. "Page"
-	page.BackgroundTransparency = 1
-	page.BorderSizePixel = 0
-	page.Size = UDim2.fromScale(1, 1)
-	page.Visible = false
-	page.Active = true
-	page.CanvasSize = UDim2.new()
-	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	page.ScrollingDirection = Enum.ScrollingDirection.Y
-	page.ScrollBarThickness = 5
-	page.ScrollBarImageColor3 = COLORS.accent
-	page.ScrollBarImageTransparency = 0.4
-	page.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
-	page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-	page.TopImage = "rbxasset://textures/ui/Scroll/scroll-middle.png"
-	page.BottomImage = "rbxasset://textures/ui/Scroll/scroll-middle.png"
-	page.Parent = self.pageHost
-
-	local pageScale = Instance.new("UIScale")
-	pageScale.Scale = 0.985
-	pageScale.Parent = page
-
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Padding = UDim.new(0, 12)
-	layout.Parent = page
-
-	-- Keep content clear of the scrollbar and give the last panel breathing room.
-	local pagePadding = Instance.new("UIPadding")
-	pagePadding.PaddingBottom = UDim.new(0, 6)
-	pagePadding.PaddingRight = UDim.new(0, 2)
-	pagePadding.Parent = page
-
-	self.pages[name] = page
-	self.pageScales[name] = pageScale
-	return page
-end
-
-function UI:createOverviewPage()
-	local page = self:createPage("Overview")
-
-	local actions = self:makePanel(page, "Connection", 1)
-	local uri = makeText(actions, "Uri", Config.WS_URL, 13, COLORS.muted, Enum.Font.Code)
-	uri.Size = UDim2.new(1, 0, 0, 20)
-	self.overviewUriLabel = uri
-	self.connectButton = makeButton(actions, "Connect", COLORS.accent)
-	self.snapshotButton = makeButton(actions, "Send Snapshot", COLORS.panelSoft)
-
-	local quick = self:makePanel(page, "Quick Actions", 2)
-	self.settingsButton = makeButton(quick, "Open Settings", COLORS.panelSoft)
-	self.outputButton = makeButton(quick, "View Output", COLORS.panelSoft)
-end
-
-function UI:createSettingsPage()
-	local page = self:createPage("Settings")
-
-	local connection = self:makePanel(page, "Connection Settings", 1)
-	makeText(connection, "UrlLabel", "WebSocket URI", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
-		UDim2.new(1, 0, 0, 18)
-	self.urlField = makeField(connection, Config.WS_URL)
-
-	local behavior = self:makePanel(page, "Behavior", 2)
-	self.debugToggle = makeButton(behavior, Config.DEBUG and "Debug: On" or "Debug: Off", COLORS.panelSoft)
-	self.debugToggle.Size = UDim2.new(1, 0, 0, 32)
-
-	makeText(behavior, "ServicesLabel", "Service List", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
-		UDim2.new(1, 0, 0, 18)
-	self.serviceField = makeField(behavior, joinServices())
-	self.serviceField.TextWrapped = false
-
-	local hint = makeText(
-		behavior,
-		"Hint",
-		"Comma-separated services. Example: Workspace, ReplicatedStorage, ServerScriptService",
-		12,
-		COLORS.muted,
-		Enum.Font.Gotham
-	)
-	hint.Size = UDim2.new(1, 0, 0, 44)
-
-	local misc = self:makePanel(page, "Misc", 3)
-	self.copyPathButton = makeButton(misc, "Copy Path", COLORS.panelSoft)
-	self.copyPathButton.Size = UDim2.new(1, 0, 0, 32)
-
-	makeText(misc, "AssetIdLabel", "Asset ID", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
-		UDim2.new(1, 0, 0, 18)
-	self.assetIdField = makeField(misc, "")
-	self.assetIdField.PlaceholderText = "Enter an asset id..."
-	self.loadAssetButton = makeButton(misc, "Load Asset", COLORS.accent)
-	self.loadAssetButton.Size = UDim2.new(1, 0, 0, 32)
-end
-
-function UI:createOutputPage()
-	local page = self:createPage("Output")
-
-	local output = self:makePanel(page, "Sync Output", 1)
-	self.outputLabel = makeText(output, "Output", "Run `sutz` in a terminal, then connect from here.", 13, COLORS.muted)
-	self.outputLabel.Size = UDim2.new(1, 0, 0, 80)
-
-	local outputActions = self:makePanel(page, "Output Actions", 2)
-	self.backToOverviewButton = makeButton(outputActions, "Back to Overview", COLORS.panelSoft)
-end
-
-function UI:makePanel(parent, titleText, order)
-	local panel = Instance.new("Frame")
-	panel.Name = titleText
-	panel.BackgroundColor3 = COLORS.panel
-	panel.BorderSizePixel = 0
-	panel.AutomaticSize = Enum.AutomaticSize.Y
-	panel.Size = UDim2.new(1, 0, 0, 0)
-	panel.LayoutOrder = order
-	panel.Parent = parent
-	corner(panel, 8)
-	stroke(panel, COLORS.border, 0.55)
-	padding(panel, 12)
-
-	local panelGradient = Instance.new("UIGradient")
-	panelGradient.Color = ColorSequence.new(Color3.fromRGB(38, 42, 52), Color3.fromRGB(28, 31, 39))
-	panelGradient.Rotation = 90
-	panelGradient.Parent = panel
-
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Padding = UDim.new(0, 8)
-	layout.Parent = panel
-
-	local title = makeText(panel, "SectionTitle", titleText, 13, COLORS.text, Enum.Font.GothamBold)
-	title.Size = UDim2.new(1, 0, 0, 18)
-
-	return panel
-end
-
-function UI:tryAttachFusionScale(scale)
-	local fusionModule = self.pluginScript:FindFirstChild("Fusion")
-	if not fusionModule then
-		return
+		local quickPanel = makePanel(page, "Quick Actions", 2)
+		self.settingsButton = Button({ name = "OpenSettings", text = "Open Settings", baseColor = COLORS.panelSoft })
+		self.settingsButton.Parent = quickPanel
+		self.outputButton = Button({ name = "ViewOutput", text = "View Output", baseColor = COLORS.panelSoft })
+		self.outputButton.Parent = quickPanel
 	end
 
-	local ok, Fusion = pcall(require, fusionModule)
-	if not ok then
-		warn("[Sutz Syncer] Fusion could not load:", Fusion)
-		return
+	do
+		local page = makePage("Settings")
+
+		local connection = makePanel(page, "Connection Settings", 1)
+		makeText(connection, "UrlLabel", "WebSocket URI", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
+			UDim2.new(1, 0, 0, 18)
+		self.urlField = Field(connection, Config.WS_URL)
+
+		local behavior = makePanel(page, "Behavior", 2)
+		self.debugToggle = Button({
+			name = "DebugToggle",
+			baseColor = COLORS.panelSoft,
+			size = UDim2.new(1, 0, 0, 32),
+			text = Computed(function(use)
+				return if use(state.debug) then "Debug: On" else "Debug: Off"
+			end),
+		})
+		self.debugToggle.Parent = behavior
+
+		makeText(behavior, "ServicesLabel", "Service List", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
+			UDim2.new(1, 0, 0, 18)
+		self.serviceField = Field(behavior, joinServices())
+		self.serviceField.TextWrapped = false
+
+		local hint = makeText(
+			behavior,
+			"Hint",
+			"Comma-separated services. Example: Workspace, ReplicatedStorage, ServerScriptService",
+			12,
+			COLORS.muted,
+			Enum.Font.Gotham
+		)
+		hint.Size = UDim2.new(1, 0, 0, 44)
+
+		local misc = makePanel(page, "Misc", 3)
+		self.copyPathButton = Button({
+			name = "CopyPath",
+			text = "Copy Path",
+			baseColor = COLORS.panelSoft,
+			size = UDim2.new(1, 0, 0, 32),
+		})
+		self.copyPathButton.Parent = misc
+
+		makeText(misc, "AssetIdLabel", "Asset ID", 12, COLORS.muted, Enum.Font.GothamMedium).Size =
+			UDim2.new(1, 0, 0, 18)
+		self.assetIdField = Field(misc, "", "Enter an asset id...")
+		self.loadAssetButton = Button({
+			name = "LoadAsset",
+			text = "Load Asset",
+			baseColor = COLORS.accent,
+			size = UDim2.new(1, 0, 0, 32),
+		})
+		self.loadAssetButton.Parent = misc
 	end
 
-	local scope = Fusion.scoped(Fusion)
-	local goal = scope:Value(1)
-	local spring = scope:Spring(goal, 24, 0.82)
-	self.fusionCleanup = scope
-	self.panelScaleGoal = goal
+	do
+		local page = makePage("Output")
 
-	local okHydrate = pcall(function()
-		scope:Hydrate(scale) {
-			Scale = spring,
-		}
-	end)
+		local output = makePanel(page, "Sync Output", 1)
+		self.outputLabel = makeText(output, "Output", "Run `sutz` in a terminal, then connect from here.", 13, COLORS.muted)
+		self.outputLabel.Size = UDim2.new(1, 0, 0, 80)
 
-	if not okHydrate then
-		self.panelScaleGoal = nil
+		local outputActions = makePanel(page, "Output Actions", 2)
+		self.backToOverviewButton = Button({ name = "BackToOverview", text = "Back to Overview", baseColor = COLORS.panelSoft })
+		self.backToOverviewButton.Parent = outputActions
 	end
 end
+
+
+
+function UI:startAmbient()
+	local accum = 0
+	local hb = RunService.Heartbeat:Connect(function(dt)
+		accum += dt
+		self.state.streakT:set((accum * 0.05) % 1) 
+		self.state.pulse:set((math.sin(accum * 3.2) + 1) * 0.5)
+	end)
+	table.insert(self.connections, hb)
+end
+
+
 
 function UI:wire()
 	table.insert(self.connections, self.widget:GetPropertyChangedSignal("Enabled"):Connect(function()
@@ -687,7 +959,7 @@ function UI:wire()
 
 	self.debugToggle.MouseButton1Click:Connect(function()
 		Config.DEBUG = not Config.DEBUG
-		setButtonText(self.debugToggle, Config.DEBUG and "Debug: On" or "Debug: Off")
+		self.state.debug:set(Config.DEBUG)
 		self:setStatus(Config.DEBUG and "Debug logging enabled" or "Debug logging disabled", COLORS.muted)
 	end)
 
@@ -715,10 +987,10 @@ function UI:wire()
 		if not isCopyPathShortcut(input) or UserInputService:GetFocusedTextBox() then
 			return
 		end
-
 		self:copySelectedPaths()
 	end))
 end
+
 
 function UI:copySelectedPaths()
 	local paths = getSelectedPaths()
@@ -779,7 +1051,6 @@ function UI:copyTextWithDaemon(text)
 		if finished then
 			return
 		end
-
 		finished = true
 		resultEvent:Fire(ok, errorMessage)
 	end
@@ -830,49 +1101,25 @@ function UI:copyTextWithDaemon(text)
 	return ok, errorMessage
 end
 
-function UI:switchPage(name, animated)
-	if not self.pages[name] then
+
+
+function UI:switchPage(name, _animated)
+	if not (name == "Overview" or name == "Settings" or name == "Output") then
 		return
 	end
-
 	self.activePage = name
-
-	for pageName, page in pairs(self.pages) do
-		local isActive = pageName == name
-		page.Visible = isActive
-		if isActive then
-			local pageScale = self.pageScales[pageName]
-			if pageScale then
-				pageScale.Scale = animated and 0.975 or 1
-				tween(pageScale, { Scale = 1 }, 0.16)
-			end
-		end
-	end
-
-	for pageName, button in pairs(self.navButtons) do
-		local isActive = pageName == name
-		tween(button, {
-			BackgroundColor3 = isActive and COLORS.accent or COLORS.panelSoft,
-			TextColor3 = isActive and Color3.fromRGB(255, 255, 255) or COLORS.muted,
-		}, animated and 0.14 or 0)
-	end
+	self.state.activePage:set(name)
 end
 
 function UI:onVisibilityChanged()
 	if self.widget.Enabled then
-		if self.panelScaleGoal then
-			self.panelScaleGoal:set(0.965)
-			task.defer(function()
-				if self.panelScaleGoal then
-					self.panelScaleGoal:set(1)
-				end
-			end)
-		else
-			self.rootScale.Scale = 0.965
-			tween(self.rootScale, { Scale = 1 }, 0.18)
-		end
+		self.state.entrance:set(0.95)
+		task.defer(function()
+			if self.state then
+				self.state.entrance:set(1)
+			end
+		end)
 	end
-
 	self:updateConnectionVisuals()
 end
 
@@ -894,13 +1141,13 @@ function UI:toggleConnection()
 		self.overviewUriLabel.Text = Config.WS_URL
 		self:saveUrl(Config.WS_URL)
 		self:setStatus("Connecting...", COLORS.accentSoft)
+
 		local connected = self.session:start()
-		-- Discovery may have picked a different port than the one typed, so
-		-- reflect whatever the session actually paired with.
 		self.overviewUriLabel.Text = Config.WS_URL
 		if connected then
 			self:setStatus("Connected", COLORS.success)
-			self.outputLabel.Text = string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL)
+			self.outputLabel.Text =
+				string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL)
 		else
 			self:setStatus("Failed to connect. Check Output.", COLORS.danger)
 			self.outputLabel.Text = self.session.lastError
@@ -913,28 +1160,14 @@ function UI:toggleConnection()
 end
 
 function UI:updateConnectionVisuals()
-	if self.session:isRunning() then
-		setButtonText(self.connectButton, "Disconnect")
-		tween(self.connectButton, { BackgroundColor3 = COLORS.danger }, 0.12)
-	else
-		setButtonText(self.connectButton, "Connect")
-		tween(self.connectButton, { BackgroundColor3 = COLORS.accent }, 0.12)
-	end
+	self.state.connected:set(self.session:isRunning())
 end
 
 function UI:setStatus(text, color)
-	if self.statusTween then
-		self.statusTween:Cancel()
-		self.statusTween = nil
-	end
-
-	self.statusLabel.Text = text
-	self.statusTween = tween(self.statusLabel, { TextColor3 = color or COLORS.muted }, 0.12)
-
-	if self.statusDot then
-		tween(self.statusDot, { BackgroundColor3 = color or COLORS.muted }, 0.12)
-	end
+	self.state.statusText:set(text)
+	self.state.statusColor:set(color or COLORS.muted)
 end
+
 
 function UI:destroy()
 	if self.session then
@@ -942,15 +1175,14 @@ function UI:destroy()
 	end
 
 	for _, connection in ipairs(self.connections) do
-		connection:Disconnect()
+		pcall(function()
+			connection:Disconnect()
+		end)
 	end
 	self.connections = {}
 
-	if self.fusionCleanup then
-		local ok, Fusion = pcall(require, self.pluginScript.Fusion)
-		if ok and Fusion.doCleanup then
-			Fusion.doCleanup(self.fusionCleanup)
-		end
+	if self.scope and self.Fusion and self.Fusion.doCleanup then
+		pcall(self.Fusion.doCleanup, self.scope)
 	end
 end
 

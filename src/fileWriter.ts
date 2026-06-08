@@ -22,14 +22,45 @@ export class FileWriter {
     this.ensureRoot();
     this.guidToPath.clear();
 
+    const keep = new Set<string>();
     let written = 0;
     for (const instance of instances) {
       if (this.writeScript(instance)) {
+        keep.add(path.normalize(this.guidToPath.get(instance.guid)!));
         written += 1;
       }
     }
 
+    // Studio is the source of truth: anything left under the sync folder that
+    // the snapshot did not write no longer exists in Studio, so delete it.
+    this.pruneExcept(keep);
+
     return written;
+  }
+
+  // Recursively delete every file under the sync root that is not in `keep`,
+  // then remove any directories left empty. Stays strictly within rootDir.
+  private pruneExcept(keep: Set<string>): void {
+    if (!fs.existsSync(this.rootDir)) {
+      return;
+    }
+
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+
+        if (entry.isDirectory()) {
+          walk(full);
+          if (fs.existsSync(full) && fs.readdirSync(full).length === 0) {
+            fs.rmdirSync(full);
+          }
+        } else if (!keep.has(path.normalize(full))) {
+          fs.unlinkSync(full);
+        }
+      }
+    };
+
+    walk(this.rootDir);
   }
 
   public writeScript(instance: StudioInstanceRecord): boolean {
