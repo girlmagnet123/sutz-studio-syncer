@@ -13,7 +13,7 @@ local toolbar = plugin:CreateToolbar("Sutz Syncer")
 local toggleButton = toolbar:CreateButton(
 	"Sutz Sync",
 	"Open Sutz Studio Syncer",
-	""
+	"rbxassetid://117603874582847"
 )
 
 toggleButton.ClickableWhenViewportHidden = true

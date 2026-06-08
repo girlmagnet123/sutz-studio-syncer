@@ -1,6 +1,7 @@
 --!nonstrict
 
 local ScriptEditorService = game:GetService("ScriptEditorService")
+local HttpService = game:GetService("HttpService")
 
 local Config = require(script.Parent.Config)
 local Protocol = require(script.Parent.Protocol)
@@ -29,8 +30,58 @@ function SyncSession.new()
 	self.guidToInstance = {}
 	self.instanceToGuid = {}
 	self.applyingPatch = false
+	self.lastError = nil
+	self.connectedUrl = nil
 
 	return self
+end
+
+local function parseUrl(url)
+	local host, port = string.match(url, "^wss?://([^:/]+):(%d+)")
+
+	if not host then
+		host = string.match(url, "^wss?://([^:/]+)")
+		port = nil
+	end
+
+	return host or "localhost", tonumber(port) or 8181
+end
+
+-- Probe http://host:port upward from the configured base port and return the
+-- ws URL of the first daemon that has no Studio paired with it yet. This is how
+-- a second Studio automatically lands on a second `sutz` instead of stealing
+-- the first one.
+function SyncSession:discoverFreeUrl()
+	local host, basePort = parseUrl(Config.WS_URL)
+	local scanCount = math.max(1, Config.PORT_SCAN_COUNT or 1)
+	local sawBusy = false
+
+	for offset = 0, scanCount - 1 do
+		local port = basePort + offset
+		local ok, body = pcall(function()
+			return HttpService:GetAsync(string.format("http://%s:%d/", host, port))
+		end)
+
+		if ok then
+			local decodedOk, status = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+
+			if decodedOk and type(status) == "table" and status.sutz then
+				if status.paired then
+					sawBusy = true
+				else
+					return string.format("ws://%s:%d", host, port), "ok"
+				end
+			end
+		end
+	end
+
+	if sawBusy then
+		return nil, "allBusy"
+	end
+
+	return nil, "none"
 end
 
 function SyncSession:isRunning()
@@ -222,6 +273,10 @@ function SyncSession:handleMessage(message)
 		self:send({ type = Protocol.ClientMessage.PONG })
 	elseif message.type == Protocol.ServerMessage.DISCONNECT then
 		self:stop()
+	elseif message.type == Protocol.ServerMessage.BUSY then
+		self.lastError = "That daemon is already paired with another Studio. Reconnect to pair with a free one."
+		warn("[Sutz Syncer]", self.lastError)
+		self:stop()
 	end
 end
 
@@ -230,9 +285,24 @@ function SyncSession:start()
 		return true
 	end
 
-	log("Connecting to", Config.WS_URL)
+	self.lastError = nil
 
-	self.client = WebSocketClient.new(Config.WS_URL)
+	local url, reason = self:discoverFreeUrl()
+	if not url then
+		if reason == "allBusy" then
+			self.lastError = "Every running `sutz` is already paired with a Studio. Run `sutz` again in another terminal, then connect."
+		else
+			self.lastError = "No `sutz` daemon found. Run `sutz` in a terminal first (and make sure HTTP requests are enabled)."
+		end
+		warn("[Sutz Syncer]", self.lastError)
+		return false
+	end
+
+	Config.WS_URL = url
+	self.connectedUrl = url
+	log("Connecting to", url)
+
+	self.client = WebSocketClient.new(url)
 	self.client:onMessage(function(message)
 		self:handleMessage(message)
 	end)

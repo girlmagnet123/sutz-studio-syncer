@@ -18,6 +18,7 @@ Protocol.ServerMessage = {
 	CLIPBOARD_RESULT = "clipboardResult",
 	PING = "ping",
 	DISCONNECT = "disconnect",
+	BUSY = "busy",
 }
 
 return Protocol

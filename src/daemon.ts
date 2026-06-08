@@ -16,11 +16,14 @@ export interface DaemonOptions {
   port: number;
   host: string;
   syncDir: string;
+  portScanCount?: number;
 }
 
 export class SutzDaemon {
   private readonly port: number;
   private readonly host: string;
+  private readonly portScanCount: number;
+  private boundPort = 0;
   private httpServer: Server | null = null;
   private socketServer: WebSocketServer | null = null;
   private studioClient: WebSocket | null = null;
@@ -34,7 +37,12 @@ export class SutzDaemon {
   public constructor(options: DaemonOptions) {
     this.port = options.port;
     this.host = options.host;
+    this.portScanCount = Math.max(1, options.portScanCount ?? 10);
     this.fileWriter = new FileWriter({ rootDir: options.syncDir });
+  }
+
+  public getPort(): number {
+    return this.boundPort;
   }
 
   public async start(): Promise<void> {
@@ -46,9 +54,21 @@ export class SutzDaemon {
     this.startFileWatcher();
 
     this.httpServer = createServer((_, response) => {
-      response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      response.end("Sutz Studio Syncer daemon is running.\n");
+      // The plugin probes this endpoint to discover a free daemon to pair with.
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      response.end(
+        JSON.stringify({
+          sutz: true,
+          port: this.boundPort,
+          paired: this.studioClient !== null,
+        }) + "\n",
+      );
     });
+
+    // Bind the port first (scanning upward if busy) so the WebSocketServer is
+    // only attached to an already-listening server. Attaching it earlier makes
+    // ws re-emit the http server's EADDRINUSE on itself and crash the process.
+    this.boundPort = await this.listen();
 
     this.socketServer = new WebSocketServer({
       server: this.httpServer,
@@ -59,16 +79,39 @@ export class SutzDaemon {
       this.handleConnection(socket);
     });
 
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer!.once("error", reject);
-      this.httpServer!.listen(this.port, this.host, () => {
-        this.httpServer!.off("error", reject);
-        resolve();
-      });
-    });
-
-    console.log(`Sutz daemon listening on ws://${this.host}:${this.port}`);
+    console.log(`Sutz daemon listening on ws://${this.host}:${this.boundPort}`);
     console.log(`Sync folder: ${path.relative(process.cwd(), this.fileWriter.getRootDir()) || "."}`);
+  }
+
+  // Bind to the requested port, scanning upward if it is already in use so that
+  // a second `sutz` lands on the next free port instead of failing.
+  private listen(): Promise<number> {
+    const tryPort = (index: number): Promise<number> => {
+      const candidate = this.port + index;
+      const server = this.httpServer!;
+
+      return new Promise<number>((resolve, reject) => {
+        const onError = (error: NodeJS.ErrnoException): void => {
+          server.off("listening", onListening);
+          if (error.code === "EADDRINUSE" && index + 1 < this.portScanCount) {
+            resolve(tryPort(index + 1));
+          } else {
+            reject(error);
+          }
+        };
+
+        const onListening = (): void => {
+          server.off("error", onError);
+          resolve(candidate);
+        };
+
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(candidate, this.host);
+      });
+    };
+
+    return tryPort(0);
   }
 
   public async stop(): Promise<void> {
@@ -137,8 +180,12 @@ export class SutzDaemon {
     switch (message.type) {
       case ClientMessageType.Hello:
         if (this.studioClient && this.studioClient !== socket) {
-          console.warn("Replacing existing Studio connection.");
-          this.studioClient.close();
+          // Already paired with another Studio. Tell the newcomer so it can
+          // discover a different daemon instead of stealing this one.
+          console.warn("Rejected a second Studio connection; already paired.");
+          this.sendTo(socket, { type: ServerMessageType.Busy });
+          socket.close();
+          return;
         }
 
         this.studioClient = socket;

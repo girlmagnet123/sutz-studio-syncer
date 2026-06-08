@@ -50,4 +50,16 @@ $env:SUTZ_SYNC_DIR = "my-sync-folder"
 sutz
 ```
 
+## Multiple Studios
+
+Each `sutz` daemon pairs with exactly one Studio. To sync several Studios at once,
+run `sutz` in several terminals (typically one per project folder): the first binds
+port `8181`, the next free port up to `8181 + SUTZ_PORT_SCAN - 1` (default 10).
+
+When you press **Connect** in the plugin, it probes those ports over HTTP and pairs
+with the first daemon that has no Studio attached, so a second Studio automatically
+lands on a second daemon instead of stealing the first one. A daemon that is already
+paired rejects new connections with a `busy` message. Override the base port with
+`SUTZ_PORT` and the scan width with `SUTZ_PORT_SCAN`.
+
 For development, `npm run dev` still runs the TypeScript source directly.

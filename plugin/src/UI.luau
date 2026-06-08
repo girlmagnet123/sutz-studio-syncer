@@ -88,18 +88,59 @@ local function makeText(parent, name, text, size, color, font)
 	return label
 end
 
+-- Finger Paint font for button labels. Font.new never errors on a bad path; if
+-- the family is unavailable Studio just falls back to the default font.
+local BUTTON_FONT = Font.new("rbxasset://fonts/families/FingerPaint.json")
+
+-- Buttons render their text as two stacked labels (a black shadow under a white
+-- label), so updating their caption has to touch both. Use this for any button
+-- whose text changes at runtime.
+local function setButtonText(button, text)
+	local label = button:FindFirstChild("Label")
+	local shadow = button:FindFirstChild("TextShadow")
+
+	if label then
+		label.Text = text
+	end
+
+	if shadow then
+		shadow.Text = text
+	end
+end
+
 local function makeButton(parent, text, backgroundColor)
 	local button = Instance.new("TextButton")
 	button.AutoButtonColor = false
 	button.BackgroundColor3 = backgroundColor or COLORS.accent
 	button.BorderSizePixel = 0
-	button.Font = Enum.Font.GothamBold
-	button.Text = text
-	button.TextColor3 = Color3.fromRGB(255, 255, 255)
-	button.TextSize = 14
+	button.Text = ""
 	button.Size = UDim2.new(1, 0, 0, 36)
 	button.Parent = parent
 	corner(button, 7)
+
+	local shadow = Instance.new("TextLabel")
+	shadow.Name = "TextShadow"
+	shadow.BackgroundTransparency = 1
+	shadow.FontFace = BUTTON_FONT
+	shadow.Text = text
+	shadow.TextColor3 = Color3.fromRGB(0, 0, 0)
+	shadow.TextTransparency = 0.35
+	shadow.TextSize = 16
+	shadow.Size = UDim2.fromScale(1, 1)
+	shadow.Position = UDim2.fromOffset(2, 2)
+	shadow.ZIndex = 2
+	shadow.Parent = button
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.BackgroundTransparency = 1
+	label.FontFace = BUTTON_FONT
+	label.Text = text
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextSize = 16
+	label.Size = UDim2.fromScale(1, 1)
+	label.ZIndex = 3
+	label.Parent = button
 
 	local scale = Instance.new("UIScale")
 	scale.Scale = 1
@@ -299,6 +340,11 @@ function UI:createContents()
 	root.Parent = self.widget
 	self.root = root
 
+	local rootGradient = Instance.new("UIGradient")
+	rootGradient.Color = ColorSequence.new(Color3.fromRGB(28, 31, 39), Color3.fromRGB(18, 19, 25))
+	rootGradient.Rotation = 90
+	rootGradient.Parent = root
+
 	local scale = Instance.new("UIScale")
 	scale.Scale = 1
 	scale.Parent = root
@@ -320,12 +366,39 @@ function UI:createContents()
 	header.LayoutOrder = 1
 	header.Parent = root
 
-	local title = makeText(header, "Title", "Sutz Studio Syncer", 20, COLORS.text, Enum.Font.GothamBold)
-	title.Size = UDim2.new(1, 0, 0, 26)
+	local logo = Instance.new("ImageLabel")
+	logo.Name = "Logo"
+	logo.BackgroundColor3 = COLORS.panel
+	logo.BorderSizePixel = 0
+	logo.Image = "rbxassetid://117603874582847"
+	logo.ScaleType = Enum.ScaleType.Fit
+	logo.Size = UDim2.fromOffset(48, 48)
+	logo.Position = UDim2.fromOffset(0, 4)
+	logo.Parent = header
+	corner(logo, 12)
+	stroke(logo, COLORS.border, 0.4)
+
+	local title = makeText(header, "Title", "Sutz Studio Syncer", 19, COLORS.text, Enum.Font.GothamBold)
+	title.Position = UDim2.fromOffset(60, 4)
+	title.Size = UDim2.new(1, -60, 0, 24)
+
+	local titleGradient = Instance.new("UIGradient")
+	titleGradient.Color = ColorSequence.new(COLORS.text, COLORS.accentSoft)
+	titleGradient.Rotation = 18
+	titleGradient.Parent = title
+
+	self.statusDot = Instance.new("Frame")
+	self.statusDot.Name = "StatusDot"
+	self.statusDot.BackgroundColor3 = COLORS.muted
+	self.statusDot.BorderSizePixel = 0
+	self.statusDot.Size = UDim2.fromOffset(8, 8)
+	self.statusDot.Position = UDim2.fromOffset(60, 36)
+	self.statusDot.Parent = header
+	corner(self.statusDot, 4)
 
 	self.statusLabel = makeText(header, "Status", "Idle", 13, COLORS.muted, Enum.Font.GothamMedium)
-	self.statusLabel.Position = UDim2.fromOffset(0, 32)
-	self.statusLabel.Size = UDim2.new(1, 0, 0, 20)
+	self.statusLabel.Position = UDim2.fromOffset(74, 32)
+	self.statusLabel.Size = UDim2.new(1, -74, 0, 20)
 
 	self.nav = Instance.new("Frame")
 	self.nav.Name = "Nav"
@@ -404,11 +477,23 @@ function UI:createNavButton(name, order)
 end
 
 function UI:createPage(name)
-	local page = Instance.new("Frame")
+	local page = Instance.new("ScrollingFrame")
 	page.Name = name .. "Page"
 	page.BackgroundTransparency = 1
+	page.BorderSizePixel = 0
 	page.Size = UDim2.fromScale(1, 1)
 	page.Visible = false
+	page.Active = true
+	page.CanvasSize = UDim2.new()
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.ScrollingDirection = Enum.ScrollingDirection.Y
+	page.ScrollBarThickness = 5
+	page.ScrollBarImageColor3 = COLORS.accent
+	page.ScrollBarImageTransparency = 0.4
+	page.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
+	page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+	page.TopImage = "rbxasset://textures/ui/Scroll/scroll-middle.png"
+	page.BottomImage = "rbxasset://textures/ui/Scroll/scroll-middle.png"
 	page.Parent = self.pageHost
 
 	local pageScale = Instance.new("UIScale")
@@ -420,6 +505,12 @@ function UI:createPage(name)
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Padding = UDim.new(0, 12)
 	layout.Parent = page
+
+	-- Keep content clear of the scrollbar and give the last panel breathing room.
+	local pagePadding = Instance.new("UIPadding")
+	pagePadding.PaddingBottom = UDim.new(0, 6)
+	pagePadding.PaddingRight = UDim.new(0, 2)
+	pagePadding.Parent = page
 
 	self.pages[name] = page
 	self.pageScales[name] = pageScale
@@ -503,6 +594,11 @@ function UI:makePanel(parent, titleText, order)
 	corner(panel, 8)
 	stroke(panel, COLORS.border, 0.55)
 	padding(panel, 12)
+
+	local panelGradient = Instance.new("UIGradient")
+	panelGradient.Color = ColorSequence.new(Color3.fromRGB(38, 42, 52), Color3.fromRGB(28, 31, 39))
+	panelGradient.Rotation = 90
+	panelGradient.Parent = panel
 
 	local layout = Instance.new("UIListLayout")
 	layout.FillDirection = Enum.FillDirection.Vertical
@@ -591,7 +687,7 @@ function UI:wire()
 
 	self.debugToggle.MouseButton1Click:Connect(function()
 		Config.DEBUG = not Config.DEBUG
-		self.debugToggle.Text = Config.DEBUG and "Debug: On" or "Debug: Off"
+		setButtonText(self.debugToggle, Config.DEBUG and "Debug: On" or "Debug: Off")
 		self:setStatus(Config.DEBUG and "Debug logging enabled" or "Debug logging disabled", COLORS.muted)
 	end)
 
@@ -799,12 +895,16 @@ function UI:toggleConnection()
 		self:saveUrl(Config.WS_URL)
 		self:setStatus("Connecting...", COLORS.accentSoft)
 		local connected = self.session:start()
+		-- Discovery may have picked a different port than the one typed, so
+		-- reflect whatever the session actually paired with.
+		self.overviewUriLabel.Text = Config.WS_URL
 		if connected then
 			self:setStatus("Connected", COLORS.success)
-			self.outputLabel.Text = "Connected. Studio changes can now be sent to the daemon."
+			self.outputLabel.Text = string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL)
 		else
 			self:setStatus("Failed to connect. Check Output.", COLORS.danger)
-			self.outputLabel.Text = "Make sure `sutz` is running and HTTP requests are enabled."
+			self.outputLabel.Text = self.session.lastError
+				or "Make sure `sutz` is running and HTTP requests are enabled."
 			self:switchPage("Output", true)
 		end
 	end
@@ -814,10 +914,10 @@ end
 
 function UI:updateConnectionVisuals()
 	if self.session:isRunning() then
-		self.connectButton.Text = "Disconnect"
+		setButtonText(self.connectButton, "Disconnect")
 		tween(self.connectButton, { BackgroundColor3 = COLORS.danger }, 0.12)
 	else
-		self.connectButton.Text = "Connect"
+		setButtonText(self.connectButton, "Connect")
 		tween(self.connectButton, { BackgroundColor3 = COLORS.accent }, 0.12)
 	end
 end
@@ -830,6 +930,10 @@ function UI:setStatus(text, color)
 
 	self.statusLabel.Text = text
 	self.statusTween = tween(self.statusLabel, { TextColor3 = color or COLORS.muted }, 0.12)
+
+	if self.statusDot then
+		tween(self.statusDot, { BackgroundColor3 = color or COLORS.muted }, 0.12)
+	end
 end
 
 function UI:destroy()

@@ -4,19 +4,21 @@ import { SutzDaemon } from "./daemon.js";
 const port = Number(process.env.SUTZ_PORT ?? 8181);
 const host = process.env.SUTZ_HOST ?? "127.0.0.1";
 const syncDir = process.env.SUTZ_SYNC_DIR ?? "sync";
+const portScanCount = Number(process.env.SUTZ_PORT_SCAN ?? 10);
 
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error(`Invalid SUTZ_PORT: ${process.env.SUTZ_PORT}`);
 }
 
-const daemon = new SutzDaemon({ host, port, syncDir });
+const daemon = new SutzDaemon({ host, port, syncDir, portScanCount });
 
 try {
   await daemon.start();
 } catch (error) {
   if (isNodeError(error) && error.code === "EADDRINUSE") {
     console.error(
-      `Port ${host}:${port} is already in use. Stop the existing daemon or set SUTZ_PORT to another port.`,
+      `Ports ${host}:${port}-${port + portScanCount - 1} are all in use. ` +
+        `Stop an existing daemon, raise SUTZ_PORT_SCAN, or set SUTZ_PORT to another base port.`,
     );
     process.exit(1);
   }

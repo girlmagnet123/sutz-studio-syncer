@@ -14,6 +14,7 @@ export const ServerMessageType = {
   ClipboardResult: "clipboardResult",
   Ping: "ping",
   Disconnect: "disconnect",
+  Busy: "busy",
 } as const;
 
 export interface StudioInstanceRecord {
@@ -79,4 +80,7 @@ export type ServerMessage =
     }
   | {
       type: typeof ServerMessageType.Disconnect;
+    }
+  | {
+      type: typeof ServerMessageType.Busy;
     };
