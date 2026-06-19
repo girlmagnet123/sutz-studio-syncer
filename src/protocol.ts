@@ -11,6 +11,7 @@ export const ClientMessageType = {
 export const ServerMessageType = {
   RequestSnapshot: "requestSnapshot",
   PatchScript: "patchScript",
+  UpsertScript: "upsertScript",
   ClipboardResult: "clipboardResult",
   Ping: "ping",
   Disconnect: "disconnect",
@@ -67,6 +68,12 @@ export type ServerMessage =
   | {
       type: typeof ServerMessageType.PatchScript;
       guid: string;
+      source: string;
+    }
+  | {
+      type: typeof ServerMessageType.UpsertScript;
+      path: string[];
+      className: "Script" | "LocalScript" | "ModuleScript";
       source: string;
     }
   | {

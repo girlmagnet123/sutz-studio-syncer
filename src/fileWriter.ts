@@ -6,6 +6,11 @@ export interface FileWriterOptions {
   rootDir: string;
 }
 
+export interface LocalScriptFile {
+  className: "Script" | "LocalScript" | "ModuleScript";
+  path: string[];
+}
+
 export class FileWriter {
   private readonly rootDir: string;
   private readonly guidToPath = new Map<string, string>();
@@ -25,6 +30,10 @@ export class FileWriter {
     const keep = new Set<string>();
     let written = 0;
     for (const instance of instances) {
+      if (this.isScript(instance)) {
+        keep.add(path.normalize(this.getFilePath(instance)));
+      }
+
       if (this.writeScript(instance)) {
         keep.add(path.normalize(this.guidToPath.get(instance.guid)!));
         written += 1;
@@ -32,7 +41,7 @@ export class FileWriter {
     }
 
     // Studio is the source of truth: anything left under the sync folder that
-    // the snapshot did not write no longer exists in Studio, so delete it.
+    // is not represented by the snapshot no longer exists in Studio, so delete it.
     this.pruneExcept(keep);
 
     return written;
@@ -103,6 +112,54 @@ export class FileWriter {
 
   public getRootDir(): string {
     return this.rootDir;
+  }
+
+  public parseScriptFilePath(filePath: string): LocalScriptFile | null {
+    const resolvedPath = path.resolve(filePath);
+    const relativePath = path.relative(this.rootDir, resolvedPath);
+
+    if (
+      relativePath === "" ||
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath)
+    ) {
+      return null;
+    }
+
+    const parsed = path.parse(relativePath);
+    const lowerName = parsed.base.toLowerCase();
+    let className: LocalScriptFile["className"] = "ModuleScript";
+    let instanceName = parsed.name;
+
+    if (lowerName.endsWith(".server.luau")) {
+      className = "Script";
+      instanceName = parsed.base.slice(0, -".server.luau".length);
+    } else if (lowerName.endsWith(".client.luau")) {
+      className = "LocalScript";
+      instanceName = parsed.base.slice(0, -".client.luau".length);
+    } else if (lowerName.endsWith(".luau")) {
+      className = "ModuleScript";
+      instanceName = parsed.base.slice(0, -".luau".length);
+    } else {
+      return null;
+    }
+
+    if (instanceName.trim() === "") {
+      return null;
+    }
+
+    const parentSegments = parsed.dir
+      ? parsed.dir.split(path.sep).filter((segment) => segment.trim() !== "")
+      : [];
+
+    if (parentSegments.length === 0) {
+      return null;
+    }
+
+    return {
+      className,
+      path: [...parentSegments, instanceName],
+    };
   }
 
   public getFilePath(instance: StudioInstanceRecord): string {

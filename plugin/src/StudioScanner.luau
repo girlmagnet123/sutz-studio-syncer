@@ -66,7 +66,11 @@ function StudioScanner.getPath(instance)
 	return getPath(instance)
 end
 
-function StudioScanner.toRecord(instance)
+function StudioScanner.toRecord(instance, includeSource)
+	if includeSource == nil then
+		includeSource = true
+	end
+
 	if not isIncluded(instance) then
 		return nil
 	end
@@ -93,14 +97,14 @@ function StudioScanner.toRecord(instance)
 		parentGuid = parentGuid,
 	}
 
-	if isScript(instance) then
+	if includeSource and isScript(instance) then
 		record.source = instance.Source
 	end
 
 	return record
 end
 
-function StudioScanner.snapshot()
+function StudioScanner.snapshot(includeSource)
 	local records = {}
 	local queue = {}
 
@@ -113,7 +117,7 @@ function StudioScanner.snapshot()
 	local index = 1
 	while index <= #queue do
 		local instance = queue[index]
-		local record = StudioScanner.toRecord(instance)
+		local record = StudioScanner.toRecord(instance, includeSource)
 
 		if record then
 			table.insert(records, record)

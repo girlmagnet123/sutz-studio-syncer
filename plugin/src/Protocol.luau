@@ -15,6 +15,7 @@ Protocol.ClientMessage = {
 Protocol.ServerMessage = {
 	REQUEST_SNAPSHOT = "requestSnapshot",
 	PATCH_SCRIPT = "patchScript",
+	UPSERT_SCRIPT = "upsertScript",
 	CLIPBOARD_RESULT = "clipboardResult",
 	PING = "ping",
 	DISCONNECT = "disconnect",

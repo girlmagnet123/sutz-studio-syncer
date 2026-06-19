@@ -18,19 +18,20 @@ local WS_URL_SETTING = "SutzStudioSyncer_WsUrl"
 local ICON = "rbxassetid://117603874582847"
 
 local COLORS = {
-	bg = Color3.fromRGB(9, 9, 12),
-	bgStreak = Color3.fromRGB(58, 66, 92),
-	panel = Color3.fromRGB(18, 19, 24),
-	panelSoft = Color3.fromRGB(27, 29, 37),
+	bg = Color3.fromRGB(10, 11, 14),
+	bgStreak = Color3.fromRGB(44, 65, 86),
+	panel = Color3.fromRGB(18, 20, 25),
+	panelSoft = Color3.fromRGB(28, 32, 39),
 	field = Color3.fromRGB(21, 23, 29),
 	fieldFocused = Color3.fromRGB(30, 33, 43),
-	border = Color3.fromRGB(48, 52, 66),
+	border = Color3.fromRGB(54, 60, 72),
 	text = Color3.fromRGB(238, 241, 248),
 	muted = Color3.fromRGB(150, 158, 176),
-	accent = Color3.fromRGB(96, 139, 255),
-	accentSoft = Color3.fromRGB(140, 176, 255),
+	accent = Color3.fromRGB(70, 150, 232),
+	accentSoft = Color3.fromRGB(134, 194, 255),
 	success = Color3.fromRGB(78, 205, 145),
 	danger = Color3.fromRGB(224, 92, 116),
+	warning = Color3.fromRGB(236, 180, 88),
 }
 
 local SERVICES = {
@@ -43,10 +44,6 @@ local SERVICES = {
 	"StarterPack",
 	"StarterPlayer",
 }
-
-
-local BUTTON_FONT = Font.new("rbxasset://fonts/families/FingerPaint.json")
-
 
 local function resolveFusion(pluginScript)
 	local candidates = {
@@ -225,6 +222,9 @@ function UI.new(plugin, pluginScript, session)
 	self.session = session
 	self.activePage = "Overview"
 	self.connections = {}
+	self.activityLines = {}
+	self.maxActivityLines = 80
+	self.wasConnected = false
 
 	self:loadSavedSettings()
 
@@ -244,12 +244,20 @@ function UI.new(plugin, pluginScript, session)
 		entrance = scope:Value(0.95), 
 	}
 
+	self.session:onActivity(function(text)
+		self:addActivity(text)
+	end)
+	self.session:onStateChanged(function(running, errorMessage, url)
+		self:onSessionStateChanged(running, errorMessage, url)
+	end)
+
 	self.widget = self:createWidget()
 	self:build()
 	self:wire()
 	self:startAmbient()
 	self:switchPage("Overview")
 	self:updateConnectionVisuals()
+	self:addActivity("Run `sutz` in a terminal, then connect from here.")
 
 	return self
 end
@@ -379,10 +387,10 @@ function UI:build()
 				New("TextLabel") {
 					Name = "Label",
 					BackgroundTransparency = 1,
-					FontFace = BUTTON_FONT,
+					Font = Enum.Font.GothamBold,
 					Text = props.text or "",
 					TextColor3 = props.textColor or Color3.fromRGB(255, 255, 255),
-					TextSize = 16,
+					TextSize = 14,
 					Size = UDim2.fromScale(1, 1),
 					ZIndex = 2,
 					[Children] = {
@@ -889,9 +897,11 @@ function UI:build()
 	do
 		local page = makePage("Output")
 
-		local output = makePanel(page, "Sync Output", 1)
-		self.outputLabel = makeText(output, "Output", "Run `sutz` in a terminal, then connect from here.", 13, COLORS.muted)
-		self.outputLabel.Size = UDim2.new(1, 0, 0, 80)
+		local output = makePanel(page, "Activity Log", 1)
+		self.outputLabel = makeText(output, "Output", "", 12, COLORS.muted, Enum.Font.Code)
+		self.outputLabel.AutomaticSize = Enum.AutomaticSize.Y
+		self.outputLabel.Size = UDim2.new(1, 0, 0, 0)
+		self.outputLabel.TextWrapped = true
 
 		local outputActions = makePanel(page, "Output Actions", 2)
 		self.backToOverviewButton = Button({ name = "BackToOverview", text = "Back to Overview", baseColor = COLORS.panelSoft })
@@ -926,10 +936,11 @@ function UI:wire()
 		if self.session:isRunning() then
 			self.session:sendSnapshot()
 			self:setStatus("Snapshot sent", COLORS.success)
-			self.outputLabel.Text = "Snapshot pushed to the local daemon."
+			self:addActivity("Snapshot pushed to the local daemon.")
 			self:switchPage("Output", true)
 		else
 			self:setStatus("Connect before sending a snapshot", COLORS.danger)
+			self:addActivity("Connect before sending a snapshot.")
 		end
 	end)
 
@@ -997,7 +1008,7 @@ function UI:copySelectedPaths()
 
 	if #paths == 0 then
 		self:setStatus("Select something first", COLORS.danger)
-		self.outputLabel.Text = "Select one or more instances in Explorer or the viewport, then copy their paths."
+		self:addActivity("Select one or more instances in Explorer or the viewport, then copy their paths.")
 		return
 	end
 
@@ -1006,13 +1017,13 @@ function UI:copySelectedPaths()
 
 	if not copied then
 		self:setStatus("Clipboard copy failed", COLORS.danger)
-		self.outputLabel.Text = (errorMessage or "Run `sutz`, then copy again.") .. "\n" .. text
+		self:addActivity((errorMessage or "Run `sutz`, then copy again.") .. "\n" .. text)
 		return
 	end
 
 	local suffix = #paths == 1 and "path" or "paths"
 	self:setStatus(string.format("Copied %d %s", #paths, suffix), COLORS.success)
-	self.outputLabel.Text = text
+	self:addActivity(text)
 end
 
 function UI:loadAsset()
@@ -1021,7 +1032,7 @@ function UI:loadAsset()
 
 	if not assetId then
 		self:setStatus("Enter a valid asset id", COLORS.danger)
-		self.outputLabel.Text = "Asset ID must be a number. Example: 123456789"
+		self:addActivity("Asset ID must be a number. Example: 123456789")
 		return
 	end
 
@@ -1031,14 +1042,14 @@ function UI:loadAsset()
 
 	if not ok then
 		self:setStatus("Asset load failed", COLORS.danger)
-		self.outputLabel.Text = string.format("Could not load asset %d:\n%s", assetId, tostring(result))
+		self:addActivity(string.format("Could not load asset %d:\n%s", assetId, tostring(result)))
 		self:switchPage("Output", true)
 		return
 	end
 
 	result.Parent = game.Workspace
 	self:setStatus("Asset loaded", COLORS.success)
-	self.outputLabel.Text = string.format("Loaded asset %d into Workspace.", assetId)
+	self:addActivity(string.format("Loaded asset %d into Workspace.", assetId))
 end
 
 function UI:copyTextWithDaemon(text)
@@ -1102,6 +1113,40 @@ function UI:copyTextWithDaemon(text)
 end
 
 
+function UI:addActivity(text)
+	local line = string.format("[%s] %s", os.date("%H:%M:%S"), tostring(text))
+	table.insert(self.activityLines, line)
+
+	while #self.activityLines > self.maxActivityLines do
+		table.remove(self.activityLines, 1)
+	end
+
+	if self.outputLabel then
+		self.outputLabel.Text = table.concat(self.activityLines, "\n")
+	end
+end
+
+function UI:onSessionStateChanged(running, errorMessage, url)
+	if url and url ~= "" then
+		self.overviewUriLabel.Text = url
+		self.urlField.Text = url
+	end
+
+	self.state.connected:set(running)
+
+	if running then
+		self.wasConnected = true
+		self:setStatus("Connected", COLORS.success)
+	elseif self.wasConnected then
+		self.wasConnected = false
+		if errorMessage and errorMessage ~= "" then
+			self:setStatus("Disconnected", COLORS.danger)
+		else
+			self:setStatus("Disconnected", COLORS.muted)
+		end
+	end
+end
+
 
 function UI:switchPage(name, _animated)
 	if not (name == "Overview" or name == "Settings" or name == "Output") then
@@ -1131,7 +1176,7 @@ function UI:toggleConnection()
 	if self.session:isRunning() then
 		self.session:stop()
 		self:setStatus("Disconnected", COLORS.muted)
-		self.outputLabel.Text = "The daemon connection is closed."
+		self:addActivity("The daemon connection is closed.")
 	else
 		local value = string.gsub(self.urlField.Text, "^%s*(.-)%s*$", "%1")
 		if value ~= "" then
@@ -1146,12 +1191,10 @@ function UI:toggleConnection()
 		self.overviewUriLabel.Text = Config.WS_URL
 		if connected then
 			self:setStatus("Connected", COLORS.success)
-			self.outputLabel.Text =
-				string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL)
+			self:addActivity(string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL))
 		else
 			self:setStatus("Failed to connect. Check Output.", COLORS.danger)
-			self.outputLabel.Text = self.session.lastError
-				or "Make sure `sutz` is running and HTTP requests are enabled."
+			self:addActivity(self.session.lastError or "Make sure `sutz` is running and HTTP requests are enabled.")
 			self:switchPage("Output", true)
 		end
 	end

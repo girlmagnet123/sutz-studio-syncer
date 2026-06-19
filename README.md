@@ -27,6 +27,8 @@ The daemon can:
 - Create a `sync` folder in the project where `sutz` is run.
 - Write Studio script snapshots into `sync`.
 - Update or remove synced script files when Studio sends changes.
+- Create or update Studio scripts when new `.luau` files are added under `sync`
+  while Studio is connected.
 
 ## Local Command
 
@@ -63,3 +65,17 @@ paired rejects new connections with a `busy` message. Override the base port wit
 `SUTZ_PORT` and the scan width with `SUTZ_PORT_SCAN`.
 
 For development, `npm run dev` still runs the TypeScript source directly.
+
+## Filesystem to Studio
+
+When Studio is connected, files created inside the sync folder are pushed into
+Studio using their path and suffix:
+
+- `sync/ServerScriptService/MyScript.server.luau` creates a `Script`.
+- `sync/StarterPlayer/StarterPlayerScripts/MyClient.client.luau` creates a `LocalScript`.
+- `sync/ReplicatedStorage/Modules/MyModule.luau` creates a `ModuleScript`.
+
+Missing intermediate folders are created as `Folder` instances. A Studio
+snapshot is still authoritative: each manual snapshot removes files from the
+sync folder when they no longer exist in Studio, keeping the folder 1:1 with
+the current Studio tree.

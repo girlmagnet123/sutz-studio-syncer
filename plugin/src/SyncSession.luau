@@ -32,8 +32,18 @@ function SyncSession.new()
 	self.applyingPatch = false
 	self.lastError = nil
 	self.connectedUrl = nil
+	self.activityHandlers = {}
+	self.stateHandlers = {}
 
 	return self
+end
+
+local function stringifyList(...)
+	local parts = {}
+	for index = 1, select("#", ...) do
+		table.insert(parts, tostring(select(index, ...)))
+	end
+	return table.concat(parts, " ")
 end
 
 local function parseUrl(url)
@@ -88,6 +98,27 @@ function SyncSession:isRunning()
 	return self.running
 end
 
+function SyncSession:onActivity(callback)
+	table.insert(self.activityHandlers, callback)
+end
+
+function SyncSession:onStateChanged(callback)
+	table.insert(self.stateHandlers, callback)
+end
+
+function SyncSession:emitActivity(...)
+	local text = stringifyList(...)
+	for _, callback in ipairs(self.activityHandlers) do
+		task.spawn(callback, text)
+	end
+end
+
+function SyncSession:emitState()
+	for _, callback in ipairs(self.stateHandlers) do
+		task.spawn(callback, self.running, self.lastError, self.connectedUrl)
+	end
+end
+
 function SyncSession:send(message)
 	if not self.client then
 		return false
@@ -110,13 +141,17 @@ function SyncSession:sendSnapshot()
 	self.guidToInstance = {}
 	self.instanceToGuid = {}
 
-	local snapshot = StudioScanner.snapshot()
+	local snapshot = StudioScanner.snapshot(false)
+	local scripts = {}
 
 	for _, record in ipairs(snapshot) do
 		local instance = self:findInstanceByPath(record.path)
 		if instance then
 			self.guidToInstance[record.guid] = instance
 			self.instanceToGuid[instance] = record.guid
+			if StudioScanner.isScript(instance) then
+				table.insert(scripts, instance)
+			end
 		end
 	end
 
@@ -125,7 +160,25 @@ function SyncSession:sendSnapshot()
 		instances = snapshot,
 	})
 
-	log("Snapshot sent:", #snapshot, "instances")
+	for index, instance in ipairs(scripts) do
+		local record = StudioScanner.toRecord(instance, true)
+		if record then
+			self:send({
+				type = Protocol.ClientMessage.SCRIPT_CHANGED,
+				guid = record.guid,
+				path = record.path,
+				className = record.className,
+				source = record.source,
+			})
+		end
+
+		if index % 25 == 0 then
+			task.wait()
+		end
+	end
+
+	log("Snapshot sent:", #snapshot, "instances,", #scripts, "scripts")
+	self:emitActivity("Snapshot sent:", #snapshot, "instances,", #scripts, "scripts")
 end
 
 function SyncSession:findInstanceByPath(path)
@@ -157,6 +210,42 @@ function SyncSession:findInstanceByPath(path)
 	return current
 end
 
+local function isScriptClass(className)
+	return className == "Script" or className == "LocalScript" or className == "ModuleScript"
+end
+
+function SyncSession:findOrCreateParent(path)
+	if type(path) ~= "table" or #path < 2 then
+		return nil, "Path must include a service and script name."
+	end
+
+	local ok, current = pcall(function()
+		return game:GetService(path[1])
+	end)
+
+	if not ok or not current then
+		return nil, string.format("Unknown service: %s", tostring(path[1]))
+	end
+
+	for index = 2, #path - 1 do
+		local segment = path[index]
+		if type(segment) ~= "string" or segment == "" then
+			return nil, "Path contains an empty folder name."
+		end
+
+		local child = current:FindFirstChild(segment)
+		if not child then
+			child = Instance.new("Folder")
+			child.Name = segment
+			child.Parent = current
+		end
+
+		current = child
+	end
+
+	return current, nil
+end
+
 function SyncSession:applyPatch(message)
 	local guid = message.guid
 	local source = message.source
@@ -182,9 +271,92 @@ function SyncSession:applyPatch(message)
 	if ok then
 		warn(string.format("{Sutz Syncer} Updated: {%s}", instance:GetFullName()))
 		debugLog("Patched script:", instance:GetFullName())
+		self:emitActivity("Patched from file:", instance:GetFullName())
 	else
 		warn("[Sutz Syncer] Failed to patch script:", err)
+		self:emitActivity("Patch failed:", tostring(err))
 	end
+end
+
+function SyncSession:upsertScript(message)
+	local scriptPath = message.path
+	local className = message.className
+	local source = message.source
+
+	if type(scriptPath) ~= "table" or not isScriptClass(className) or type(source) ~= "string" then
+		self:emitActivity("Ignored invalid upsertScript message.")
+		return
+	end
+
+	local parent, parentError = self:findOrCreateParent(scriptPath)
+	if not parent then
+		warn("[Sutz Syncer] Could not create script from file:", parentError)
+		self:emitActivity("Create from file failed:", parentError)
+		return
+	end
+
+	local scriptName = scriptPath[#scriptPath]
+	if type(scriptName) ~= "string" or scriptName == "" then
+		self:emitActivity("Create from file failed: empty script name.")
+		return
+	end
+
+	local instance = parent:FindFirstChild(scriptName)
+	if instance and not StudioScanner.isScript(instance) then
+		local messageText = string.format("Path already exists and is not a script: %s", instance:GetFullName())
+		warn("[Sutz Syncer]", messageText)
+		self:emitActivity("Create from file failed:", messageText)
+		return
+	end
+
+	if instance and instance.ClassName ~= className then
+		local messageText = string.format(
+			"Path already exists as %s, not %s: %s",
+			instance.ClassName,
+			className,
+			instance:GetFullName()
+		)
+		warn("[Sutz Syncer]", messageText)
+		self:emitActivity("Create from file failed:", messageText)
+		return
+	end
+
+	local created = false
+	self.applyingPatch = true
+	local ok, err = pcall(function()
+		if not instance then
+			instance = Instance.new(className)
+			instance.Name = scriptName
+			instance.Parent = parent
+			created = true
+		end
+
+		ScriptEditorService:UpdateSourceAsync(instance, function()
+			return source
+		end)
+	end)
+	self.applyingPatch = false
+
+	if not ok then
+		warn("[Sutz Syncer] Failed to create script from file:", err)
+		self:emitActivity("Create from file failed:", tostring(err))
+		return
+	end
+
+	local record = StudioScanner.toRecord(instance, true)
+	if record then
+		self:indexInstance(instance)
+		self:send({
+			type = Protocol.ClientMessage.SCRIPT_CHANGED,
+			guid = record.guid,
+			path = record.path,
+			className = record.className,
+			source = record.source,
+		})
+	end
+
+	local verb = created and "Created from file:" or "Updated from file:"
+	self:emitActivity(verb, table.concat(scriptPath, "/"))
 end
 
 function SyncSession:onStudioScriptChanged(instance)
@@ -209,6 +381,7 @@ function SyncSession:onStudioScriptChanged(instance)
 		className = record.className,
 		source = record.source,
 	})
+	self:emitActivity("Studio script changed:", table.concat(record.path, "/"))
 end
 
 function SyncSession:onInstanceChanged(instance)
@@ -226,6 +399,7 @@ function SyncSession:onInstanceChanged(instance)
 		type = Protocol.ClientMessage.INSTANCE_CHANGED,
 		instance = record,
 	})
+	self:emitActivity("Instance changed:", table.concat(record.path, "/"))
 end
 
 function SyncSession:attachInstance(instance)
@@ -266,9 +440,12 @@ function SyncSession:handleMessage(message)
 	debugLog("Received:", message.type)
 
 	if message.type == Protocol.ServerMessage.REQUEST_SNAPSHOT then
+		self:emitActivity("Daemon requested snapshot")
 		self:sendSnapshot()
 	elseif message.type == Protocol.ServerMessage.PATCH_SCRIPT then
 		self:applyPatch(message)
+	elseif message.type == Protocol.ServerMessage.UPSERT_SCRIPT then
+		self:upsertScript(message)
 	elseif message.type == Protocol.ServerMessage.PING then
 		self:send({ type = Protocol.ClientMessage.PONG })
 	elseif message.type == Protocol.ServerMessage.DISCONNECT then
@@ -301,6 +478,7 @@ function SyncSession:start()
 	Config.WS_URL = url
 	self.connectedUrl = url
 	log("Connecting to", url)
+	self:emitActivity("Connecting to", url)
 
 	self.client = WebSocketClient.new(url)
 	self.client:onMessage(function(message)
@@ -309,20 +487,32 @@ function SyncSession:start()
 	self.client:onClose(function()
 		if self.running then
 			log("Daemon connection closed")
+			self.lastError = "Daemon connection closed."
+			self:emitActivity(self.lastError)
 			self:stop()
 		end
 	end)
 	self.client:onError(function(err)
 		warn("[Sutz Syncer] WebSocket error:", err)
+		self.lastError = tostring(err)
+		self:emitActivity("WebSocket error:", tostring(err))
+		if self.running then
+			self:stop()
+		else
+			self:emitState()
+		end
 	end)
 
 	if not self.client:connect() then
 		warn("[Sutz Syncer] Could not connect. Is the daemon running?")
 		self.client = nil
+		self.lastError = self.lastError or "Could not connect. Is the daemon running?"
+		self:emitState()
 		return false
 	end
 
 	self.running = true
+	self:emitState()
 	self:attachExistingListeners()
 
 	table.insert(self.connections, game.DescendantAdded:Connect(function(instance)
@@ -337,6 +527,7 @@ function SyncSession:start()
 				type = Protocol.ClientMessage.INSTANCE_REMOVED,
 				guid = guid,
 			})
+			self:emitActivity("Instance removed:", guid)
 		end
 	end))
 
@@ -346,8 +537,8 @@ function SyncSession:start()
 		client = "roblox-studio-plugin",
 	})
 
-	self:sendSnapshot()
 	log("Sync started")
+	self:emitActivity("Sync started")
 	return true
 end
 
@@ -372,6 +563,8 @@ function SyncSession:stop()
 	self.instanceToGuid = {}
 
 	log("Sync stopped")
+	self:emitActivity("Sync stopped")
+	self:emitState()
 end
 
 return SyncSession

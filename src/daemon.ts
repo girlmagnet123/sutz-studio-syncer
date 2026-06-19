@@ -72,7 +72,7 @@ export class SutzDaemon {
 
     this.socketServer = new WebSocketServer({
       server: this.httpServer,
-      maxPayload: 128 * 1024 * 1024,
+      maxPayload: 512 * 1024 * 1024,
     });
 
     this.socketServer.on("connection", (socket) => {
@@ -160,6 +160,9 @@ export class SutzDaemon {
 
     socket.on("error", (error) => {
       console.error("Studio socket error:", error);
+      if (this.studioClient === socket) {
+        this.studioClient = null;
+      }
     });
   }
 
@@ -206,7 +209,13 @@ export class SutzDaemon {
         {
           const written = this.fileWriter.writeSnapshot(message.instances);
           this.indexSyncedScripts(message.instances);
-          console.log(`Wrote ${written} script file(s) to sync folder.`);
+          const scriptCount = message.instances.filter((instance) => this.isScript(instance)).length;
+          const sourceCount = message.instances.filter((instance) => typeof instance.source === "string").length;
+          if (sourceCount === 0 && scriptCount > 0) {
+            console.log(`Snapshot indexed ${scriptCount} script path(s); waiting for script sources.`);
+          } else {
+            console.log(`Wrote ${written} script file(s) to sync folder.`);
+          }
         }
         console.log(`Snapshot received: ${message.instances.length} instances.`);
         break;
@@ -317,7 +326,10 @@ export class SutzDaemon {
   private scheduleFilePatch(filePath: string): void {
     const normalizedPath = this.normalizeFilePath(filePath);
 
-    if (!this.filePathToGuid.has(normalizedPath)) {
+    if (
+      !this.filePathToGuid.has(normalizedPath) &&
+      !this.fileWriter.parseScriptFilePath(normalizedPath)
+    ) {
       return;
     }
 
@@ -337,6 +349,7 @@ export class SutzDaemon {
   private patchStudioFromFile(filePath: string): void {
     const guid = this.filePathToGuid.get(filePath);
     if (!guid) {
+      this.upsertStudioFromFile(filePath);
       return;
     }
 
@@ -370,6 +383,35 @@ export class SutzDaemon {
 
     instance.source = source;
     console.log(`Patched Studio script from file: ${path.relative(process.cwd(), filePath)}`);
+  }
+
+  private upsertStudioFromFile(filePath: string): void {
+    const scriptFile = this.fileWriter.parseScriptFilePath(filePath);
+    if (!scriptFile || !fs.existsSync(filePath)) {
+      return;
+    }
+
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      return;
+    }
+
+    const source = fs.readFileSync(filePath, "utf8");
+    const sent = this.send({
+      type: ServerMessageType.UpsertScript,
+      path: scriptFile.path,
+      className: scriptFile.className,
+      source,
+    });
+
+    if (!sent) {
+      console.warn(
+        `Local script file detected, but no Studio client is connected: ${path.relative(process.cwd(), filePath)}`,
+      );
+      return;
+    }
+
+    console.log(`Sent local script file to Studio: ${scriptFile.path.join("/")}`);
   }
 
   private indexSyncedScripts(instances: StudioInstanceRecord[]): void {
