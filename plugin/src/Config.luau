@@ -9,6 +9,7 @@ local Config = {
 	-- a free daemon. Each `sutz` instance binds the next free port, so this lets
 	-- multiple Studios each pair with their own daemon automatically.
 	PORT_SCAN_COUNT = 10,
+	WS_CONNECT_TIMEOUT = 1.5,
 
 	-- Keep the first version conservative. We can make this user-configurable
 	-- after the daemon and installer are in place.

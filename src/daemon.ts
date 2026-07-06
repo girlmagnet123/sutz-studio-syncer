@@ -53,8 +53,15 @@ export class SutzDaemon {
     this.fileWriter.ensureRoot();
     this.startFileWatcher();
 
-    this.httpServer = createServer((_, response) => {
+    this.httpServer = createServer((request, response) => {
       // The plugin probes this endpoint to discover a free daemon to pair with.
+      const requestUrl = new URL(request.url ?? "/", `http://${this.host}:${this.boundPort || this.port}`);
+      if (!["/", "/status", "/sutz/status"].includes(requestUrl.pathname)) {
+        response.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ sutz: false, error: "not_found" }) + "\n");
+        return;
+      }
+
       response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       response.end(
         JSON.stringify({

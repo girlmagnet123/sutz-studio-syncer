@@ -57,6 +57,10 @@ local function preferIpv4Loopback(url)
 	end))
 end
 
+local function makeWebSocketUrl(scheme, host, port)
+	return string.format("%s://%s:%d", scheme or "ws", host or "127.0.0.1", port or 8181)
+end
+
 local function normalizeWebSocketUrl(url)
 	local value = trim(url)
 
@@ -90,14 +94,14 @@ end
 
 local function parseUrl(url)
 	local normalized = normalizeWebSocketUrl(url)
-	local host, port = string.match(normalized, "^wss?://([^:/]+):(%d+)")
+	local scheme, host, port = string.match(normalized, "^(wss?)://([^:/]+):(%d+)")
 
 	if not host then
-		host = string.match(normalized, "^wss?://([^:/]+)")
+		scheme, host = string.match(normalized, "^(wss?)://([^:/]+)")
 		port = nil
 	end
 
-	return host or "localhost", tonumber(port) or 8181, normalized
+	return host or "127.0.0.1", tonumber(port) or 8181, normalized, scheme or "ws"
 end
 
 function SyncSession.normalizeWebSocketUrl(url)
@@ -123,17 +127,20 @@ end
 -- a second Studio automatically lands on a second `sutz` instead of stealing
 -- the first one.
 function SyncSession:discoverFreeUrl(baseUrl)
-	local host, basePort = parseUrl(baseUrl or self:getBaseUrl())
+	local host, basePort, _, wsScheme = parseUrl(baseUrl or self:getBaseUrl())
+	local httpScheme = if wsScheme == "wss" then "https" else "http"
 	local scanCount = math.max(1, Config.PORT_SCAN_COUNT or 1)
 	local sawBusy = false
+	local sawHttpResponse = false
 
 	for offset = 0, scanCount - 1 do
 		local port = basePort + offset
 		local ok, body = pcall(function()
-			return HttpService:GetAsync(string.format("http://%s:%d/", host, port))
+			return HttpService:GetAsync(string.format("%s://%s:%d/status", httpScheme, host, port))
 		end)
 
 		if ok then
+			sawHttpResponse = true
 			local decodedOk, status = pcall(function()
 				return HttpService:JSONDecode(body)
 			end)
@@ -142,7 +149,7 @@ function SyncSession:discoverFreeUrl(baseUrl)
 				if status.paired then
 					sawBusy = true
 				else
-					return string.format("ws://%s:%d", host, port), "ok"
+					return makeWebSocketUrl(wsScheme, host, port), "ok"
 				end
 			end
 		end
@@ -152,7 +159,19 @@ function SyncSession:discoverFreeUrl(baseUrl)
 		return nil, "allBusy"
 	end
 
-	return nil, "none"
+	return nil, if sawHttpResponse then "none" else "probeFailed"
+end
+
+function SyncSession:getCandidateUrls(baseUrl)
+	local host, basePort, _, wsScheme = parseUrl(baseUrl or self:getBaseUrl())
+	local scanCount = math.max(1, Config.PORT_SCAN_COUNT or 1)
+	local urls = {}
+
+	for offset = 0, scanCount - 1 do
+		table.insert(urls, makeWebSocketUrl(wsScheme, host, basePort + offset))
+	end
+
+	return urls
 end
 
 function SyncSession:isRunning()
@@ -518,20 +537,167 @@ function SyncSession:handleMessage(message)
 	end
 end
 
+function SyncSession:connectToUrl(url)
+	local client = WebSocketClient.new(url)
+	local handshakeEvent = Instance.new("BindableEvent")
+	local queuedMessages = {}
+	local forwarding = false
+	local resolved = false
+	local accepted = false
+	local failureReason = nil
+
+	local function finish(ok, reason)
+		if resolved then
+			return
+		end
+
+		resolved = true
+		accepted = ok == true
+		failureReason = reason
+		handshakeEvent:Fire()
+	end
+
+	client:onMessage(function(message)
+		if not forwarding then
+			if type(message) == "table" and message.type == Protocol.ServerMessage.BUSY then
+				finish(false, "busy")
+			else
+				table.insert(queuedMessages, message)
+				finish(true, "ok")
+			end
+			return
+		end
+
+		self:handleMessage(message)
+	end)
+
+	client:onClose(function()
+		if not forwarding then
+			finish(false, "closed")
+		elseif self.running then
+			log("Daemon connection closed")
+			self.lastError = "Daemon connection closed."
+			self:emitActivity(self.lastError)
+			self:stop()
+		end
+	end)
+
+	client:onError(function(err)
+		if not forwarding then
+			finish(false, tostring(err))
+		else
+			warn("[Sutz Syncer] WebSocket error:", err)
+			self.lastError = tostring(err)
+			self:emitActivity("WebSocket error:", tostring(err))
+			if self.running then
+				self:stop()
+			else
+				self:emitState()
+			end
+		end
+	end)
+
+	if not client:connect() then
+		client:close()
+		handshakeEvent:Destroy()
+		return false, failureReason or "connectFailed"
+	end
+
+	local sent = client:send({
+		type = Protocol.ClientMessage.HELLO,
+		protocolVersion = Config.PROTOCOL_VERSION,
+		client = "roblox-studio-plugin",
+	})
+
+	if not sent then
+		client:close()
+		handshakeEvent:Destroy()
+		return false, "sendFailed"
+	end
+
+	task.delay(Config.WS_CONNECT_TIMEOUT or 1.5, function()
+		finish(false, "timeout")
+	end)
+
+	handshakeEvent.Event:Wait()
+	handshakeEvent:Destroy()
+
+	if not accepted then
+		client:close()
+		return false, failureReason or "connectFailed"
+	end
+
+	self.client = client
+
+	local function enableForwarding()
+		forwarding = true
+	end
+
+	return true, "ok", queuedMessages, enableForwarding
+end
+
 function SyncSession:start(baseUrl)
 	if self.running then
 		return true
 	end
 
 	self.lastError = nil
-	local configuredUrl = self:setBaseUrl(baseUrl or Config.WS_URL)
+	self.client = nil
 
-	local url, reason = self:discoverFreeUrl(configuredUrl)
-	if not url then
-		if reason == "allBusy" then
+	local configuredUrl = self:setBaseUrl(baseUrl or Config.WS_URL)
+	local discoveredUrl, reason = self:discoverFreeUrl(configuredUrl)
+	local candidateUrls = {}
+
+	if discoveredUrl then
+		table.insert(candidateUrls, discoveredUrl)
+		for _, url in ipairs(self:getCandidateUrls(configuredUrl)) do
+			if url ~= discoveredUrl then
+				table.insert(candidateUrls, url)
+			end
+		end
+	elseif reason == "allBusy" then
+		self.lastError = "Every running `sutz` is already paired with a Studio. Run `sutz` again in another terminal, then connect."
+		warn("[Sutz Syncer]", self.lastError)
+		self.connectedUrl = nil
+		self:emitState()
+		return false
+	else
+		candidateUrls = self:getCandidateUrls(configuredUrl)
+		debugLog("HTTP discovery failed; trying WebSocket ports directly.")
+	end
+
+	local connectedUrl = nil
+	local queuedMessages = nil
+	local enableForwarding = nil
+	local sawBusy = false
+	local lastFailure = reason
+
+	for _, url in ipairs(candidateUrls) do
+		log("Connecting to", url)
+		self:emitActivity("Connecting to", url)
+
+		local connected, failure, messages, forward = self:connectToUrl(url)
+		if connected then
+			connectedUrl = url
+			queuedMessages = messages or {}
+			enableForwarding = forward
+			break
+		else
+			lastFailure = failure
+			if failure == "busy" then
+				sawBusy = true
+				debugLog("Daemon busy:", url)
+			else
+				debugLog("Connection attempt failed:", url, tostring(failure))
+			end
+		end
+	end
+
+	if not connectedUrl then
+		if sawBusy or reason == "allBusy" then
 			self.lastError = "Every running `sutz` is already paired with a Studio. Run `sutz` again in another terminal, then connect."
 		else
-			self.lastError = "No `sutz` daemon found. Run `sutz` in a terminal first (and make sure HTTP requests are enabled)."
+			self.lastError = "No `sutz` daemon found. Run `sutz` in a terminal first."
 		end
 		warn("[Sutz Syncer]", self.lastError)
 		self.connectedUrl = nil
@@ -539,41 +705,7 @@ function SyncSession:start(baseUrl)
 		return false
 	end
 
-	self.connectedUrl = url
-	log("Connecting to", url)
-	self:emitActivity("Connecting to", url)
-
-	self.client = WebSocketClient.new(url)
-	self.client:onMessage(function(message)
-		self:handleMessage(message)
-	end)
-	self.client:onClose(function()
-		if self.running then
-			log("Daemon connection closed")
-			self.lastError = "Daemon connection closed."
-			self:emitActivity(self.lastError)
-			self:stop()
-		end
-	end)
-	self.client:onError(function(err)
-		warn("[Sutz Syncer] WebSocket error:", err)
-		self.lastError = tostring(err)
-		self:emitActivity("WebSocket error:", tostring(err))
-		if self.running then
-			self:stop()
-		else
-			self:emitState()
-		end
-	end)
-
-	if not self.client:connect() then
-		warn("[Sutz Syncer] Could not connect. Is the daemon running?")
-		self.client = nil
-		self.lastError = self.lastError or "Could not connect. Is the daemon running?"
-		self:emitState()
-		return false
-	end
-
+	self.connectedUrl = connectedUrl
 	self.running = true
 	self:emitState()
 	self:attachExistingListeners()
@@ -594,11 +726,13 @@ function SyncSession:start(baseUrl)
 		end
 	end))
 
-	self:send({
-		type = Protocol.ClientMessage.HELLO,
-		protocolVersion = Config.PROTOCOL_VERSION,
-		client = "roblox-studio-plugin",
-	})
+	if enableForwarding then
+		enableForwarding()
+	end
+
+	for _, message in ipairs(queuedMessages or {}) do
+		self:handleMessage(message)
+	end
 
 	log("Sync started")
 	self:emitActivity("Sync started")
