@@ -2,7 +2,7 @@
 
 This folder contains the first Studio-side slice of Sutz Studio Syncer.
 
-The plugin connects to a local daemon at `ws://localhost:8181`, sends a Studio snapshot, and can receive script patches back from the daemon.
+The plugin connects to a local daemon at `ws://127.0.0.1:8181`, sends a Studio snapshot, and can receive script patches back from the daemon.
 
 ## Current Protocol
 

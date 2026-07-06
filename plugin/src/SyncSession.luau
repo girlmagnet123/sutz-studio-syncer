@@ -32,6 +32,7 @@ function SyncSession.new()
 	self.applyingPatch = false
 	self.lastError = nil
 	self.connectedUrl = nil
+	self.baseUrl = Config.WS_URL
 	self.activityHandlers = {}
 	self.stateHandlers = {}
 
@@ -46,23 +47,83 @@ local function stringifyList(...)
 	return table.concat(parts, " ")
 end
 
+local function trim(value)
+	return string.gsub(tostring(value or ""), "^%s*(.-)%s*$", "%1")
+end
+
+local function preferIpv4Loopback(url)
+	return (string.gsub(url, "^(wss?://)localhost([:/]?)", function(scheme, separator)
+		return scheme .. "127.0.0.1" .. separator
+	end))
+end
+
+local function normalizeWebSocketUrl(url)
+	local value = trim(url)
+
+	if value == "" then
+		return "ws://127.0.0.1:8181"
+	end
+
+	if string.match(value, "^%d+$") then
+		return "ws://127.0.0.1:" .. value
+	end
+
+	local portOnly = string.match(value, "^:(%d+)$")
+	if portOnly then
+		return "ws://127.0.0.1:" .. portOnly
+	end
+
+	if string.match(value, "^https://") then
+		return preferIpv4Loopback("wss://" .. string.sub(value, 9))
+	end
+
+	if string.match(value, "^http://") then
+		return preferIpv4Loopback("ws://" .. string.sub(value, 8))
+	end
+
+	if string.match(value, "^wss?://") then
+		return preferIpv4Loopback(value)
+	end
+
+	return preferIpv4Loopback("ws://" .. value)
+end
+
 local function parseUrl(url)
-	local host, port = string.match(url, "^wss?://([^:/]+):(%d+)")
+	local normalized = normalizeWebSocketUrl(url)
+	local host, port = string.match(normalized, "^wss?://([^:/]+):(%d+)")
 
 	if not host then
-		host = string.match(url, "^wss?://([^:/]+)")
+		host = string.match(normalized, "^wss?://([^:/]+)")
 		port = nil
 	end
 
-	return host or "localhost", tonumber(port) or 8181
+	return host or "localhost", tonumber(port) or 8181, normalized
+end
+
+function SyncSession.normalizeWebSocketUrl(url)
+	return normalizeWebSocketUrl(url)
+end
+
+function SyncSession:setBaseUrl(url)
+	self.baseUrl = normalizeWebSocketUrl(url)
+	Config.WS_URL = self.baseUrl
+	return self.baseUrl
+end
+
+function SyncSession:getBaseUrl()
+	return self.baseUrl or Config.WS_URL
+end
+
+function SyncSession:getConnectedUrl()
+	return self.connectedUrl
 end
 
 -- Probe http://host:port upward from the configured base port and return the
 -- ws URL of the first daemon that has no Studio paired with it yet. This is how
 -- a second Studio automatically lands on a second `sutz` instead of stealing
 -- the first one.
-function SyncSession:discoverFreeUrl()
-	local host, basePort = parseUrl(Config.WS_URL)
+function SyncSession:discoverFreeUrl(baseUrl)
+	local host, basePort = parseUrl(baseUrl or self:getBaseUrl())
 	local scanCount = math.max(1, Config.PORT_SCAN_COUNT or 1)
 	local sawBusy = false
 
@@ -457,14 +518,15 @@ function SyncSession:handleMessage(message)
 	end
 end
 
-function SyncSession:start()
+function SyncSession:start(baseUrl)
 	if self.running then
 		return true
 	end
 
 	self.lastError = nil
+	local configuredUrl = self:setBaseUrl(baseUrl or Config.WS_URL)
 
-	local url, reason = self:discoverFreeUrl()
+	local url, reason = self:discoverFreeUrl(configuredUrl)
 	if not url then
 		if reason == "allBusy" then
 			self.lastError = "Every running `sutz` is already paired with a Studio. Run `sutz` again in another terminal, then connect."
@@ -472,10 +534,11 @@ function SyncSession:start()
 			self.lastError = "No `sutz` daemon found. Run `sutz` in a terminal first (and make sure HTTP requests are enabled)."
 		end
 		warn("[Sutz Syncer]", self.lastError)
+		self.connectedUrl = nil
+		self:emitState()
 		return false
 	end
 
-	Config.WS_URL = url
 	self.connectedUrl = url
 	log("Connecting to", url)
 	self:emitActivity("Connecting to", url)
@@ -561,6 +624,7 @@ function SyncSession:stop()
 	self.client = nil
 	self.guidToInstance = {}
 	self.instanceToGuid = {}
+	self.connectedUrl = nil
 
 	log("Sync stopped")
 	self:emitActivity("Sync stopped")

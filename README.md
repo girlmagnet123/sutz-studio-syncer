@@ -16,7 +16,7 @@ The initial Studio plugin scaffold lives in `plugin/src`.
 It can:
 
 - Create a Studio toolbar button.
-- Connect to `ws://localhost:8181`.
+- Connect to `ws://127.0.0.1:8181`.
 - Send an initial Studio snapshot.
 - Send script, instance, and removal messages.
 - Receive `patchScript` messages and apply source through `ScriptEditorService`.
@@ -63,6 +63,11 @@ with the first daemon that has no Studio attached, so a second Studio automatica
 lands on a second daemon instead of stealing the first one. A daemon that is already
 paired rejects new connections with a `busy` message. Override the base port with
 `SUTZ_PORT` and the scan width with `SUTZ_PORT_SCAN`.
+
+Leave the plugin's WebSocket URI set to the base URL, usually
+`ws://127.0.0.1:8181`. The plugin shows the actual paired daemon after it connects
+but does not save that paired port as the new base, so every Studio can keep the
+same setting and auto-pair with daemon `8181`, `8182`, `8183`, and so on.
 
 For development, `npm run dev` still runs the TypeScript source directly.
 

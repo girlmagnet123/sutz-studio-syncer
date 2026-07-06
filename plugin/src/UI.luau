@@ -227,6 +227,7 @@ function UI.new(plugin, pluginScript, session)
 	self.wasConnected = false
 
 	self:loadSavedSettings()
+	self.session:setBaseUrl(Config.WS_URL)
 
 	local Fusion = resolveFusion(pluginScript)
 	self.Fusion = Fusion
@@ -959,11 +960,13 @@ function UI:wire()
 	self.urlField.FocusLost:Connect(function()
 		local value = string.gsub(self.urlField.Text, "^%s*(.-)%s*$", "%1")
 		if value ~= "" then
-			Config.WS_URL = value
-			self.overviewUriLabel.Text = value
-			self:saveUrl(value)
+			local url = self.session:setBaseUrl(value)
+			self.overviewUriLabel.Text = url
+			self.urlField.Text = url
+			self:saveUrl(url)
 			self:setStatus("URI updated", COLORS.success)
 		else
+			self.session:setBaseUrl(Config.WS_URL)
 			self.urlField.Text = Config.WS_URL
 		end
 	end)
@@ -1055,7 +1058,8 @@ end
 function UI:copyTextWithDaemon(text)
 	local requestId = HttpService:GenerateGUID(false)
 	local resultEvent = Instance.new("BindableEvent")
-	local client = WebSocketClient.new(Config.WS_URL)
+	local daemonUrl = self.session:getConnectedUrl() or Config.WS_URL
+	local client = WebSocketClient.new(daemonUrl)
 	local finished = false
 
 	local function finish(ok, errorMessage)
@@ -1127,10 +1131,9 @@ function UI:addActivity(text)
 end
 
 function UI:onSessionStateChanged(running, errorMessage, url)
-	if url and url ~= "" then
-		self.overviewUriLabel.Text = url
-		self.urlField.Text = url
-	end
+	local displayUrl = if running and url and url ~= "" then url else Config.WS_URL
+	self.overviewUriLabel.Text = displayUrl
+	self.urlField.Text = Config.WS_URL
 
 	self.state.connected:set(running)
 
@@ -1178,20 +1181,24 @@ function UI:toggleConnection()
 		self:setStatus("Disconnected", COLORS.muted)
 		self:addActivity("The daemon connection is closed.")
 	else
+		local baseUrl = Config.WS_URL
 		local value = string.gsub(self.urlField.Text, "^%s*(.-)%s*$", "%1")
 		if value ~= "" then
-			Config.WS_URL = value
+			baseUrl = self.session:setBaseUrl(value)
+		else
+			baseUrl = self.session:setBaseUrl(baseUrl)
 		end
-		self.urlField.Text = Config.WS_URL
-		self.overviewUriLabel.Text = Config.WS_URL
-		self:saveUrl(Config.WS_URL)
+		self.urlField.Text = baseUrl
+		self.overviewUriLabel.Text = baseUrl
+		self:saveUrl(baseUrl)
 		self:setStatus("Connecting...", COLORS.accentSoft)
 
-		local connected = self.session:start()
-		self.overviewUriLabel.Text = Config.WS_URL
+		local connected = self.session:start(baseUrl)
+		local connectedUrl = self.session:getConnectedUrl() or baseUrl
+		self.overviewUriLabel.Text = connectedUrl
 		if connected then
 			self:setStatus("Connected", COLORS.success)
-			self:addActivity(string.format("Paired with %s. Studio changes are now synced to that daemon.", Config.WS_URL))
+			self:addActivity(string.format("Paired with %s. Studio changes are now synced to that daemon.", connectedUrl))
 		else
 			self:setStatus("Failed to connect. Check Output.", COLORS.danger)
 			self:addActivity(self.session.lastError or "Make sure `sutz` is running and HTTP requests are enabled.")

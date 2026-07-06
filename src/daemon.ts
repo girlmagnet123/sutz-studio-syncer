@@ -60,7 +60,7 @@ export class SutzDaemon {
         JSON.stringify({
           sutz: true,
           port: this.boundPort,
-          paired: this.studioClient !== null,
+          paired: this.isPaired(),
         }) + "\n",
       );
     });
@@ -159,11 +159,30 @@ export class SutzDaemon {
     });
 
     socket.on("error", (error) => {
-      console.error("Studio socket error:", error);
+      this.logSocketError(error);
       if (this.studioClient === socket) {
         this.studioClient = null;
       }
+      socket.close();
     });
+  }
+
+  private isPaired(): boolean {
+    return this.studioClient?.readyState === WebSocket.OPEN;
+  }
+
+  private logSocketError(error: Error): void {
+    const code = "code" in error ? String(error.code) : "";
+
+    if (code === "WS_ERR_UNEXPECTED_RSV_2_3") {
+      console.error(
+        "Studio socket error: received non-standard WebSocket bytes. " +
+          "Make sure the plugin is using a ws:// URL from Sutz discovery, not an http:// URL or browser tab.",
+      );
+      return;
+    }
+
+    console.error("Studio socket error:", error);
   }
 
   private handleRawMessage(socket: WebSocket, raw: string): void {

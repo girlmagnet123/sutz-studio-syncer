@@ -2,7 +2,7 @@
 
 local Config = {
 	PROTOCOL_VERSION = 1,
-	WS_URL = "ws://localhost:8181",
+	WS_URL = "ws://127.0.0.1:8181",
 	DEBUG = true,
 
 	-- How many ports to probe upward from the WS_URL port when auto-discovering
