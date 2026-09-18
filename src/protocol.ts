@@ -14,6 +14,7 @@ export const ClientMessageType = {
 
 export const ServerMessageType = {
   RequestSnapshot: "requestSnapshot",
+  MessageAck: "messageAck",
   SnapshotAck: "snapshotAck",
   SnapshotError: "snapshotError",
   PatchScript: "patchScript",
@@ -95,6 +96,11 @@ export type ServerMessage =
       type: typeof ServerMessageType.RequestSnapshot;
       snapshotBatches: true;
       messageChunks: true;
+      messageAcks: true;
+    }
+  | {
+      type: typeof ServerMessageType.MessageAck;
+      sequence: number;
     }
   | {
       type: typeof ServerMessageType.SnapshotAck;

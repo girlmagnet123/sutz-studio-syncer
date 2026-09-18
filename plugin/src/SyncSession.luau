@@ -316,8 +316,8 @@ function SyncSession:sendSnapshot()
 	if not self.running or not self.client then
 		return false
 	end
-	if not self.snapshotBatches or not self.client.messageChunks then
-		self.lastError = "This daemon does not support snapshot batches and message fragments. Run npm run build, restart sutz, and reconnect."
+	if not self.snapshotBatches or not self.client.messageChunks or not self.client.messageAcks then
+		self.lastError = "This daemon does not support snapshot batches and acknowledged message fragments. Run npm run build, restart sutz, and reconnect."
 		self:emitActivity(self.lastError)
 		self:stop()
 		return false
@@ -342,7 +342,7 @@ function SyncSession:sendSnapshot()
 			return self:failSnapshot(state, err)
 		end
 
-		local maxBytes = math.min(Config.SNAPSHOT_MAX_BYTES or 48 * 1024, 48 * 1024)
+		local maxBytes = math.min(Config.SNAPSHOT_MAX_BYTES or 48 * 1024 - 64, 48 * 1024 - 64)
 		local maxRecords = math.min(Config.SNAPSHOT_MAX_RECORDS or 200, 200)
 		local records = {}
 		local recordBytes = 0

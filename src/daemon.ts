@@ -100,8 +100,8 @@ export class SutzDaemon {
       maxPayload: 0, // Snapshot messages are bounded by the plugin's batch size.
     });
 
-    this.socketServer.on("connection", (socket) => {
-      this.handleConnection(socket);
+    this.socketServer.on("connection", (socket, request) => {
+      this.handleConnection(socket, String(request.headers["sec-websocket-extensions"] ?? ""));
     });
 
     console.log(`Sutz daemon listening on ws://${this.host}:${this.boundPort}`);
@@ -171,8 +171,9 @@ export class SutzDaemon {
     }
   }
 
-  private handleConnection(socket: WebSocket): void {
+  private handleConnection(socket: WebSocket, offeredExtensions = ""): void {
     console.log("Client connected.");
+    let lastCompleteMessageBytes: number | null = null;
 
     socket.on("message", (raw) => {
       const byteLength = Array.isArray(raw)
@@ -196,6 +197,7 @@ export class SutzDaemon {
         socket.close(1009, "Update Studio plugin: use batched snapshots");
         return;
       }
+      lastCompleteMessageBytes = byteLength;
       this.handleRawMessage(socket, text);
     });
 
@@ -209,7 +211,7 @@ export class SutzDaemon {
 
     socket.on("error", (error) => {
       this.discardSnapshot(socket);
-      this.logSocketError(error);
+      this.logSocketError(error, offeredExtensions, socket.extensions, lastCompleteMessageBytes);
       if (this.studioClient === socket) {
         this.studioClient = null;
       }
@@ -221,13 +223,26 @@ export class SutzDaemon {
     return this.studioClient?.readyState === WebSocket.OPEN;
   }
 
-  private logSocketError(error: Error): void {
+  private logSocketError(
+    error: Error,
+    offeredExtensions: string,
+    negotiatedExtensions: string,
+    lastCompleteMessageBytes: number | null,
+  ): void {
     const code = "code" in error ? String(error.code) : "";
 
-    if (code === "WS_ERR_UNEXPECTED_RSV_2_3") {
+    if (code === "WS_ERR_UNEXPECTED_RSV_1" || code === "WS_ERR_UNEXPECTED_RSV_2_3") {
+      const detail = code === "WS_ERR_UNEXPECTED_RSV_1"
+        ? "received an invalid RSV1 compression bit. Unnegotiated compression or malformed WebSocket framing can cause this."
+        : "received invalid RSV2/RSV3 reserved bits. The incoming WebSocket framing is malformed.";
       console.error(
-        "Studio socket error: received non-standard WebSocket bytes. " +
-          "Make sure the plugin is using a ws:// URL from Sutz discovery, not an http:// URL or browser tab.",
+        `Studio socket error (${code}): ${detail}`,
+        {
+          offeredExtensions: offeredExtensions || "(none)",
+          negotiatedExtensions: negotiatedExtensions || "(none)",
+          // This is the previous complete message, not the rejected frame.
+          lastCompleteMessageBytes,
+        },
       );
       return;
     }
@@ -250,20 +265,37 @@ export class SutzDaemon {
       return;
     }
 
-    if (message.type === ClientMessageType.MessageChunk) {
-      if (socket !== this.studioClient) return;
-      if (!allowChunks) {
-        this.rejectMessageChunks(socket, "Nested message chunks are not supported.");
+    const transportSequence = "transportSequence" in message ? message.transportSequence : undefined;
+    if (transportSequence !== undefined
+      && (!allowChunks || typeof transportSequence !== "number"
+        || !Number.isSafeInteger(transportSequence) || transportSequence < 1)) {
+      this.failSnapshot(socket, undefined, "Invalid transport acknowledgement sequence.");
+      socket.close(1008, "Invalid transport sequence");
+      return;
+    }
+
+    try {
+      if (message.type === ClientMessageType.MessageChunk) {
+        if (socket !== this.studioClient) return;
+        if (!allowChunks) {
+          this.rejectMessageChunks(socket, "Nested message chunks are not supported.");
+          return;
+        }
+        this.receiveMessageChunk(socket, message);
         return;
       }
-      this.receiveMessageChunk(socket, message);
-      return;
+      if (this.pendingMessage?.socket === socket) {
+        this.rejectMessageChunks(socket, "An individual message was interrupted before all its chunks arrived.");
+        return;
+      }
+      this.handleMessage(socket, message);
+    } finally {
+      // A transport ACK bounds the plugin's outgoing queue. It confirms receipt
+      // of this wire message; snapshotAck still determines snapshot validity.
+      if (typeof transportSequence === "number" && socket === this.studioClient) {
+        this.sendTo(socket, { type: ServerMessageType.MessageAck, sequence: transportSequence });
+      }
     }
-    if (this.pendingMessage?.socket === socket) {
-      this.rejectMessageChunks(socket, "An individual message was interrupted before all its chunks arrived.");
-      return;
-    }
-    this.handleMessage(socket, message);
   }
 
   private receiveMessageChunk(socket: WebSocket, message: Extract<ClientMessage, { type: "messageChunk" }>): void {
@@ -320,7 +352,12 @@ export class SutzDaemon {
 
         this.studioClient = socket;
         console.log("Studio connected.");
-        this.sendTo(socket, { type: ServerMessageType.RequestSnapshot, snapshotBatches: true, messageChunks: true });
+        this.sendTo(socket, {
+          type: ServerMessageType.RequestSnapshot,
+          snapshotBatches: true,
+          messageChunks: true,
+          messageAcks: true,
+        });
         console.log(
           `Studio hello: ${message.client} protocol v${message.protocolVersion}`,
         );

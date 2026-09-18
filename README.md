@@ -78,6 +78,31 @@ then start `sutz` again. Updating GitHub does not rebuild a running local daemon
 Changes under `plugin/src` also need to be installed in the Studio plugin; restart
 Studio after replacing its local plugin file.
 
+To package updated plugin sources with the Fusion library and assets from your
+installed plugin, run `npm run build:plugin`. This writes
+`dist/SutzStudioSyncerPlugin.rbxmx`. The builder accepts an explicit template with
+`powershell -File scripts/build-plugin.ps1 -TemplatePath <existing-plugin.rbxmx>`.
+Replace the installed local plugin with the generated file and restart Studio.
+Publishing to Roblox is only necessary when distributing the plugin to other users.
+
+### WebSocket frame errors
+
+`WS_ERR_UNEXPECTED_RSV_1` means the receiver found an unexpected reserved/compression
+bit in a WebSocket frame, before parsing any sync JSON. If no compression extension
+was negotiated, compressed frames are invalid; malformed framing can produce the
+same error. This error alone does not establish a plugin version mismatch.
+`WS_ERR_UNEXPECTED_RSV_2_3` also indicates invalid reserved bits in the incoming
+framing; it does not establish that the configured URL is wrong.
+
+The daemon logs the offered and negotiated extensions and the byte size of the last
+complete message for both errors. Rebuild and restart `sutz` to use these diagnostics.
+Compare `plugin/src` with both the Studio plugin source and its installed local
+plugin file when investigating version differences; editing a model in
+`ServerStorage` does not reload the installed plugin. Keep WebSocket frame validation
+enabled, and use the diagnostic details to establish the cause before changing
+compression settings. An incomplete snapshot is discarded when its socket fails;
+the last committed sync files are preserved.
+
 ## Large snapshots
 
 The plugin sends only `Script`, `LocalScript`, and `ModuleScript` records and their
@@ -87,7 +112,7 @@ Only scripts and the ancestors needed to detect path changes are watched; renami
 or moving a container updates the paths of its tracked scripts. Discovery scans
 each selected service once, then snapshots use the script index.
 
-The plugin streams script metadata in batches of at most 48 KiB and 200 records,
+The plugin streams script metadata in batches of at most 48 KiB minus 64 bytes and 200 records,
 waiting for the daemon to acknowledge each batch before sending the next one.
 The daemon processes each batch separately and keeps records as objects; it never
 reassembles the whole place into a JSON string. It only removes stale sync files
@@ -101,7 +126,25 @@ are split into UTF-8-safe `messageChunk` envelopes before being sent; the daemon
 reassembles only that one update, never the entire place snapshot. This also keeps
 large script messages out of the WebSocket 64-bit payload-length encoding.
 
-Run `npm test` to build and run the daemon's batching regression tests.
+Every outgoing wire message after the initial hello now also waits for a
+`messageAck` from the daemon. The 64-byte reserve keeps the added transport sequence
+inside the 48 KiB limit. Only one wire message is outstanding at a time, including
+fragments of large script sources. A single worker keeps logical messages ordered,
+so live edits cannot interleave with a fragmented source while waiting. Pending
+encoded messages are capped at 64 MiB, and a 30-second ACK timeout closes the
+connection and releases waiting senders. Native socket errors are forwarded to
+the plugin UI. `Send()` returning successfully only queues data in Roblox; the
+transport acknowledgement confirms the daemon received it.
+
+Update both sides for this version: the plugin requires the daemon's `messageAcks`
+capability. The daemon still accepts older plugins, but they retain their old send
+behavior. Transport ACKs do not replace snapshot validation or mean a complete
+snapshot has committed.
+
+Run `npm test` to build and run the transport regression checks, including an
+11.4 MiB Unicode script transfer and malformed-frame recovery. The separate
+`scripts/check-plugin-flow-control.luau` harness exercises the plugin with mocked
+sockets in Studio Edit mode, without networking or a play session.
 
 ## Filesystem to Studio
 

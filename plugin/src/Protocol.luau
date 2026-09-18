@@ -18,6 +18,7 @@ Protocol.ClientMessage = {
 
 Protocol.ServerMessage = {
 	REQUEST_SNAPSHOT = "requestSnapshot",
+	MESSAGE_ACK = "messageAck",
 	SNAPSHOT_ACK = "snapshotAck",
 	SNAPSHOT_ERROR = "snapshotError",
 	PATCH_SCRIPT = "patchScript",
