@@ -4,8 +4,10 @@ local StudioScanner = {}
 
 local Config = require(script.Parent.Config)
 
+local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true }
+
 local function isScript(instance)
-	return instance:IsA("Script") or instance:IsA("LocalScript") or instance:IsA("ModuleScript")
+	return SCRIPT_CLASSES[instance.ClassName] == true
 end
 
 local function getPath(instance)
@@ -71,7 +73,8 @@ function StudioScanner.toRecord(instance, includeSource)
 		includeSource = true
 	end
 
-	if not isIncluded(instance) then
+	-- Non-script objects are traversed for discovery, never serialized or indexed.
+	if not isScript(instance) or not isIncluded(instance) then
 		return nil
 	end
 
@@ -82,22 +85,14 @@ function StudioScanner.toRecord(instance, includeSource)
 		return nil
 	end
 
-	local parentGuid = nil
-	if instance.Parent and instance.Parent ~= game then
-		parentGuid = getGuid(instance.Parent)
-	elseif instance.Parent == game then
-		parentGuid = "root"
-	end
-
 	local record = {
 		guid = guid,
 		className = instance.ClassName,
 		name = instance.Name,
 		path = path,
-		parentGuid = parentGuid,
 	}
 
-	if includeSource and isScript(instance) then
+	if includeSource then
 		record.source = instance.Source
 	end
 
@@ -139,8 +134,46 @@ function StudioScanner.visitInstances(visitor, root)
 	return true
 end
 
+-- Enumerate each selected service once in native code, then cheaply filter by
+-- class. Do not calculate paths/GUIDs or allocate a DFS frame for millions of
+-- poses/parts. Arbitrary containers remain searchable, including animation data.
+function StudioScanner.visitScripts(visitor, root, shouldContinue)
+	local roots = {}
+	if root then
+		table.insert(roots, root)
+	else
+		for _, service in ipairs(game:GetChildren()) do
+			if Config.SYNC_SERVICES[service.Name] then
+				table.insert(roots, service)
+			end
+		end
+	end
+
+	for _, scanRoot in ipairs(roots) do
+		if shouldContinue and not shouldContinue() then
+			return false
+		end
+		if isScript(scanRoot) and visitor(scanRoot) == false then
+			return false
+		end
+		local descendants = scanRoot:GetDescendants()
+		for index, instance in ipairs(descendants) do
+			if isScript(instance) and visitor(instance) == false then
+				return false
+			end
+			if index % 10000 == 0 then
+				task.wait()
+				if shouldContinue and not shouldContinue() then
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
+
 function StudioScanner.visit(includeSource, visitor, root)
-	return StudioScanner.visitInstances(function(instance)
+	return StudioScanner.visitScripts(function(instance)
 		local record = StudioScanner.toRecord(instance, includeSource)
 		if record then
 			return visitor(record, instance)

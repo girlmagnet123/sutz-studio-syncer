@@ -38,6 +38,10 @@ function SyncSession.new()
 	self.snapshotBatches = false
 	self.snapshot = nil
 	self.attachedInstances = {}
+	self.instanceAncestors = {}
+	self.ancestorWatchers = {}
+	self.pendingInstances = {}
+	self.flushScheduled = false
 
 	return self
 end
@@ -211,6 +215,9 @@ function SyncSession:send(message)
 end
 
 function SyncSession:indexInstance(instance)
+	if not StudioScanner.isScript(instance) or not StudioScanner.isIncluded(instance) then
+		return nil
+	end
 	local guid = StudioScanner.getGuid(instance)
 	if guid then
 		self.guidToInstance[guid] = instance
@@ -272,72 +279,33 @@ function SyncSession:sendSnapshotStep(state, sequence, message, encoded)
 	return true
 end
 
-function SyncSession:markSnapshotDirty(instance, includeDescendants)
+function SyncSession:markSnapshotDirty(instance)
 	local state = self.snapshot
-	if not state then
+	if not state or not StudioScanner.isScript(instance) then
 		return false
 	end
 	state.dirtyInstances[instance] = true
-	if includeDescendants then
-		state.dirtyRoots[instance] = true
-	end
 	return true
 end
 
 function SyncSession:reconcileSnapshot(state)
 	-- Keep only an instance set, not a copy of every intermediate event/source.
 	-- Events during a yield go into the next pass, which reads the latest state.
-	while next(state.dirtyInstances) or next(state.dirtyRoots) do
+	while next(state.dirtyInstances) do
 		local dirtyInstances = state.dirtyInstances
-		local dirtyRoots = state.dirtyRoots
 		state.dirtyInstances = {}
-		state.dirtyRoots = {}
-		local sent = {}
 		local count = 0
-		local failure = nil
-		local function reconcile(instance)
+		for instance in pairs(dirtyInstances) do
 			if not self:isSnapshotCurrent(state) then
-				failure = state.error or "Snapshot cancelled."
-				return false
+				return false, state.error or "Snapshot cancelled."
 			end
-			if sent[instance] then
-				return "skip"
-			end
-			sent[instance] = true
-			local record = StudioScanner.toRecord(instance, true)
-			local message = nil
-			if record then
-				self:indexInstance(instance)
-				message = { type = Protocol.ClientMessage.INSTANCE_CHANGED, instance = record }
-			else
-				local guid = self.instanceToGuid[instance]
-				if guid then
-					message = { type = Protocol.ClientMessage.INSTANCE_REMOVED, guid = guid }
-					self.instanceToGuid[instance] = nil
-					self.guidToInstance[guid] = nil
-				end
-			end
-			if message then
-				local ok, err = state.client:send(message)
-				if not ok then
-					failure = err or "Could not reconcile an instance changed during snapshot."
-					return false
-				end
+			local ok, err = self:syncInstance(instance, state.client)
+			if not ok then
+				return false, err or "Could not reconcile a script changed during snapshot."
 			end
 			count += 1
 			if count % 25 == 0 then
 				task.wait()
-			end
-			return true
-		end
-		for root in pairs(dirtyRoots) do
-			if not StudioScanner.visitInstances(reconcile, root) then
-				return false, failure
-			end
-		end
-		for instance in pairs(dirtyInstances) do
-			if not reconcile(instance) then
-				return false, failure
 			end
 		end
 	end
@@ -362,7 +330,6 @@ function SyncSession:sendSnapshot()
 		id = HttpService:GenerateGUID(false),
 		client = self.client,
 		dirtyInstances = {},
-		dirtyRoots = {},
 		totalBytes = 0,
 	}
 	self.snapshot = state
@@ -382,7 +349,12 @@ function SyncSession:sendSnapshot()
 		local sequence = 0
 		local instanceCount = 0
 		local scripts = {}
-		local seen = {}
+		-- Discovery already indexed scripts and installed their listeners. Copy
+		-- that small set so yielding for acknowledgements never rescans the map.
+		local snapshotInstances = {}
+		for instance in pairs(self.attachedInstances) do
+			table.insert(snapshotInstances, instance)
+		end
 		local prefix = ""
 		local function updatePrefix()
 			local header = HttpService:JSONEncode({
@@ -412,22 +384,14 @@ function SyncSession:sendSnapshot()
 			return true
 		end
 
-		local scanned = StudioScanner.visit(false, function(record, instance)
+		local function appendRecord(record, instance)
 			if not self:isSnapshotCurrent(state) then
 				err = state.error or "Snapshot cancelled."
 				return false
 			end
-			-- A reparent during traversal can expose the same instance twice.
-			if seen[record.guid] then
-				self:markSnapshotDirty(instance, true)
-				return true
-			end
-			seen[record.guid] = true
 			self.guidToInstance[record.guid] = instance
 			self.instanceToGuid[instance] = record.guid
-			if StudioScanner.isScript(instance) then
-				scripts[instance] = true
-			end
+			scripts[instance] = true
 			local encoded = HttpService:JSONEncode(record)
 			local separatorBytes = if #records > 0 then 1 else 0
 			if #records >= maxRecords or #prefix + recordBytes + separatorBytes + #encoded + 2 > maxBytes then
@@ -446,7 +410,19 @@ function SyncSession:sendSnapshot()
 			table.insert(records, encoded)
 			recordBytes += #encoded
 			return true
-		end)
+		end
+		local scanned = true
+		for _, instance in ipairs(snapshotInstances) do
+			local record = StudioScanner.toRecord(instance, false)
+			if record then
+				if not appendRecord(record, instance) then
+					scanned = false
+					break
+				end
+			else
+				self:markSnapshotDirty(instance)
+			end
+		end
 		if not scanned or not flush() then
 			return self:failSnapshot(state, err or "Snapshot traversal failed.")
 		end
@@ -489,9 +465,9 @@ function SyncSession:sendSnapshot()
 			return self:failSnapshot(state, err or "Snapshot cancelled.")
 		end
 		self.snapshot = nil
-		log("Snapshot sent:", instanceCount, "instances in", sequence, "batches;", scriptCount, "scripts")
-		self:emitActivity("Snapshot sent:", instanceCount, "instances in", sequence, "batches;", scriptCount,
-			"scripts;", state.totalBytes, "metadata bytes")
+		log("Snapshot sent:", instanceCount, "script records in", sequence, "batches;", scriptCount, "sources")
+		self:emitActivity("Snapshot sent:", instanceCount, "script records in", sequence, "batches;", scriptCount,
+			"sources;", state.totalBytes, "metadata bytes")
 		return true
 	end)
 	if not completed then
@@ -588,7 +564,7 @@ function SyncSession:applyPatch(message)
 	self.applyingPatch = false
 
 	if ok then
-		self:markSnapshotDirty(instance, false)
+		self:markSnapshotDirty(instance)
 		warn(string.format("{Sutz Syncer} Updated: {%s}", instance:GetFullName()))
 		debugLog("Patched script:", instance:GetFullName())
 		self:emitActivity("Patched from file:", instance:GetFullName())
@@ -665,16 +641,9 @@ function SyncSession:upsertScript(message)
 
 	local record = StudioScanner.toRecord(instance, true)
 	if record then
-		self:indexInstance(instance)
-		if self:markSnapshotDirty(instance, false) then
-			-- Parent folders can also have been created while patch callbacks were
-			-- suppressed. Reconcile those records after the snapshot commits.
-			local ancestor = instance.Parent
-			while ancestor and ancestor ~= game do
-				self:markSnapshotDirty(ancestor, false)
-				ancestor = ancestor.Parent
-			end
-		else
+		self:attachInstance(instance)
+		self:refreshAncestorWatchers(instance)
+		if not self:markSnapshotDirty(instance) then
 			self:send({
 				type = Protocol.ClientMessage.SCRIPT_CHANGED,
 				guid = record.guid,
@@ -690,10 +659,10 @@ function SyncSession:upsertScript(message)
 end
 
 function SyncSession:onStudioScriptChanged(instance)
-	if not self.running then
+	if not self.running or not StudioScanner.isScript(instance) then
 		return
 	end
-	if self:markSnapshotDirty(instance, false) or self.applyingPatch then
+	if self:markSnapshotDirty(instance) or self.applyingPatch then
 		return
 	end
 
@@ -717,60 +686,156 @@ function SyncSession:onStudioScriptChanged(instance)
 	self:emitActivity("Studio script changed:", table.concat(record.path, "/"))
 end
 
+function SyncSession:refreshAncestorWatchers(instance)
+	local previous = self.instanceAncestors[instance] or {}
+	local ancestors = {}
+	if self.attachedInstances[instance] and StudioScanner.isIncluded(instance) then
+		local ancestor = instance.Parent
+		while ancestor and ancestor ~= game do
+			ancestors[ancestor] = true
+			local watcher = self.ancestorWatchers[ancestor]
+			if not watcher then
+				watcher = { scripts = {}, connections = {} }
+				self.ancestorWatchers[ancestor] = watcher
+				local function changed()
+					-- The set contains only relevant scripts, even when this model
+					-- also contains millions of unrelated objects.
+					for descendant in pairs(watcher.scripts) do
+						self:onInstanceChanged(descendant)
+					end
+				end
+				table.insert(watcher.connections, ancestor:GetPropertyChangedSignal("Name"):Connect(changed))
+				table.insert(watcher.connections, ancestor:GetPropertyChangedSignal("Parent"):Connect(changed))
+			end
+			watcher.scripts[instance] = true
+			ancestor = ancestor.Parent
+		end
+	end
+	for ancestor in pairs(previous) do
+		if not ancestors[ancestor] then
+			local watcher = self.ancestorWatchers[ancestor]
+			if watcher then
+				watcher.scripts[instance] = nil
+				if not next(watcher.scripts) then
+					for _, connection in ipairs(watcher.connections) do
+						connection:Disconnect()
+					end
+					self.ancestorWatchers[ancestor] = nil
+				end
+			end
+		end
+	end
+	self.instanceAncestors[instance] = if next(ancestors) then ancestors else nil
+end
+
+function SyncSession:detachInstance(instance, keepGuid)
+	local connections = self.attachedInstances[instance]
+	if connections then
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+		self.attachedInstances[instance] = nil
+	end
+	self:refreshAncestorWatchers(instance)
+	self.pendingInstances[instance] = nil
+	if not keepGuid then
+		local guid = self.instanceToGuid[instance]
+		self.instanceToGuid[instance] = nil
+		if guid then
+			self.guidToInstance[guid] = nil
+		end
+	end
+end
+
+-- Called after Parent events settle, or while reconciling a completed
+-- snapshot. A removal retains its GUID until its final state is known.
+function SyncSession:syncInstance(instance, client)
+	if not StudioScanner.isScript(instance) then
+		return true
+	end
+	local record = StudioScanner.toRecord(instance, true)
+	if record then
+		self:attachInstance(instance)
+		self:refreshAncestorWatchers(instance)
+		local ok, err = (client or self.client):send({
+			type = Protocol.ClientMessage.INSTANCE_CHANGED,
+			instance = record,
+		})
+		if ok then
+			self:emitActivity("Script path changed:", table.concat(record.path, "/"))
+		end
+		return ok, err
+	end
+	local guid = self.instanceToGuid[instance]
+	local ok, err = true, nil
+	if guid then
+		ok, err = (client or self.client):send({ type = Protocol.ClientMessage.INSTANCE_REMOVED, guid = guid })
+		if ok then
+			self:emitActivity("Script removed:", guid)
+		end
+	end
+	self:detachInstance(instance)
+	return ok, err
+end
+
 function SyncSession:onInstanceChanged(instance)
-	if not self.running then
+	if not self.running or not StudioScanner.isScript(instance) then
 		return
 	end
-	if self:markSnapshotDirty(instance, true) or self.applyingPatch then
+	if self:markSnapshotDirty(instance) or self.applyingPatch then
 		return
 	end
-
-	local record = StudioScanner.toRecord(instance)
-	if not record then
+	self.pendingInstances[instance] = true
+	if self.flushScheduled then
 		return
 	end
-
-	self:indexInstance(instance)
-	self:send({
-		type = Protocol.ClientMessage.INSTANCE_CHANGED,
-		instance = record,
-	})
-	self:emitActivity("Instance changed:", table.concat(record.path, "/"))
+	self.flushScheduled = true
+	local client = self.client
+	task.defer(function()
+		if not self.running or self.client ~= client then
+			return
+		end
+		self.flushScheduled = false
+		local pending = self.pendingInstances
+		self.pendingInstances = {}
+		for changed in pairs(pending) do
+			if not self:markSnapshotDirty(changed) then
+				self:syncInstance(changed, client)
+			end
+		end
+	end)
 end
 
 function SyncSession:attachInstance(instance)
-	if not StudioScanner.isIncluded(instance) or self.attachedInstances[instance] then
+	if not StudioScanner.isScript(instance) or not StudioScanner.isIncluded(instance)
+		or self.attachedInstances[instance] then
 		return
 	end
-	self.attachedInstances[instance] = true
-
+	local connections = {}
+	self.attachedInstances[instance] = connections
 	self:indexInstance(instance)
-
-	table.insert(self.connections, instance:GetPropertyChangedSignal("Name"):Connect(function()
+	self:refreshAncestorWatchers(instance)
+	table.insert(connections, instance:GetPropertyChangedSignal("Name"):Connect(function()
 		self:onInstanceChanged(instance)
 	end))
-
-	table.insert(self.connections, instance:GetPropertyChangedSignal("Parent"):Connect(function()
-		if instance.Parent then
-			self:onInstanceChanged(instance)
-		end
+	table.insert(connections, instance:GetPropertyChangedSignal("Parent"):Connect(function()
+		self:onInstanceChanged(instance)
 	end))
-
-	if StudioScanner.isScript(instance) then
-		table.insert(self.connections, instance:GetPropertyChangedSignal("Source"):Connect(function()
-			self:onStudioScriptChanged(instance)
-		end))
-	end
+	table.insert(connections, instance:GetPropertyChangedSignal("Source"):Connect(function()
+		self:onStudioScriptChanged(instance)
+	end))
 end
 
 function SyncSession:attachExistingListeners()
 	local client = self.client
-	StudioScanner.visitInstances(function(instance)
+	StudioScanner.visitScripts(function(instance)
 		if not self.running or self.client ~= client then
 			return false
 		end
 		self:attachInstance(instance)
 		return true
+	end, nil, function()
+		return self.running and self.client == client
 	end)
 end
 
@@ -995,38 +1060,31 @@ function SyncSession:start(baseUrl)
 	self.running = true
 	self:emitState()
 
-	table.insert(self.connections, game.DescendantAdded:Connect(function(instance)
-		self:attachInstance(instance)
-		self:onInstanceChanged(instance)
-	end))
-
-	table.insert(self.connections, game.DescendantRemoving:Connect(function(instance)
-		if self:markSnapshotDirty(instance, true) then
-			return
+	-- Service-level events also catch scripts moved back from an excluded
+	-- service. game.DescendantAdded alone misses moves within the same game.
+	for serviceName, enabled in pairs(Config.SYNC_SERVICES) do
+		if enabled then
+			local ok, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if ok and service then
+				table.insert(self.connections, service.DescendantAdded:Connect(function(instance)
+					if not StudioScanner.isScript(instance) then
+						return
+					end
+					self:attachInstance(instance)
+					self:onInstanceChanged(instance)
+				end))
+				table.insert(self.connections, service.DescendantRemoving:Connect(function(instance)
+					if not StudioScanner.isScript(instance) then
+						return
+					end
+					-- Changes are coalesced/deferred until Parent has settled.
+					self:onInstanceChanged(instance)
+				end))
+			end
 		end
-		local client = self.client
-		-- DescendantRemoving runs before Parent has actually changed.
-		task.defer(function()
-			if not self.running or self.client ~= client then
-				return
-			end
-			if self:markSnapshotDirty(instance, true) then
-				return
-			end
-			if StudioScanner.isIncluded(instance) then
-				self:onInstanceChanged(instance)
-				return
-			end
-			local guid = self.instanceToGuid[instance]
-			if guid then
-				if self:send({ type = Protocol.ClientMessage.INSTANCE_REMOVED, guid = guid }) then
-					self:emitActivity("Instance removed:", guid)
-				end
-				self.instanceToGuid[instance] = nil
-				self.guidToInstance[guid] = nil
-			end
-		end)
-	end))
+	end
 	self:attachExistingListeners()
 
 	if enableForwarding then
@@ -1061,6 +1119,16 @@ function SyncSession:stop()
 		connection:Disconnect()
 	end
 	self.connections = {}
+	for _, connections in pairs(self.attachedInstances) do
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+	end
+	for _, watcher in pairs(self.ancestorWatchers) do
+		for _, connection in ipairs(watcher.connections) do
+			connection:Disconnect()
+		end
+	end
 
 	if self.client then
 		self.client:close()
@@ -1070,6 +1138,10 @@ function SyncSession:stop()
 	self.guidToInstance = {}
 	self.instanceToGuid = {}
 	self.attachedInstances = {}
+	self.instanceAncestors = {}
+	self.ancestorWatchers = {}
+	self.pendingInstances = {}
+	self.flushScheduled = false
 	self.connectedUrl = nil
 
 	log("Sync stopped")

@@ -80,7 +80,14 @@ Studio after replacing its local plugin file.
 
 ## Large snapshots
 
-The plugin streams instance metadata in batches of at most 48 KiB and 200 records,
+The plugin sends only `Script`, `LocalScript`, and `ModuleScript` records and their
+full paths. Parts, folders, models, keyframes, poses, and other objects are not
+serialized. Scripts nested inside any of those objects are still discovered.
+Only scripts and the ancestors needed to detect path changes are watched; renaming
+or moving a container updates the paths of its tracked scripts. Discovery scans
+each selected service once, then snapshots use the script index.
+
+The plugin streams script metadata in batches of at most 48 KiB and 200 records,
 waiting for the daemon to acknowledge each batch before sending the next one.
 The daemon processes each batch separately and keeps records as objects; it never
 reassembles the whole place into a JSON string. It only removes stale sync files
