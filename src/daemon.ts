@@ -79,7 +79,7 @@ export class SutzDaemon {
 
     this.socketServer = new WebSocketServer({
       server: this.httpServer,
-      maxPayload: 512 * 1024 * 1024,
+      maxPayload: 0, // no limit test
     });
 
     this.socketServer.on("connection", (socket) => {
