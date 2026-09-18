@@ -71,6 +71,31 @@ same setting and auto-pair with daemon `8181`, `8182`, `8183`, and so on.
 
 For development, `npm run dev` still runs the TypeScript source directly.
 
+## Updating the syncer
+
+After changing the daemon's TypeScript, stop the running daemon, run `npm run build`,
+then start `sutz` again. Updating GitHub does not rebuild a running local daemon.
+Changes under `plugin/src` also need to be installed in the Studio plugin; restart
+Studio after replacing its local plugin file.
+
+## Large snapshots
+
+The plugin streams instance metadata in batches of at most 48 KiB and 200 records,
+waiting for the daemon to acknowledge each batch before sending the next one.
+The daemon processes each batch separately and keeps records as objects; it never
+reassembles the whole place into a JSON string. It only removes stale sync files
+after every batch and the final record count have been received successfully.
+Interrupted or invalid metadata transfers leave the previous synced files intact.
+
+Update both the daemon and the Studio plugin together. An older daemon that does
+not support batches is rejected with an update message. Script sources are sent
+individually after the metadata transfer. Individual updates larger than 48 KiB
+are split into UTF-8-safe `messageChunk` envelopes before being sent; the daemon
+reassembles only that one update, never the entire place snapshot. This also keeps
+large script messages out of the WebSocket 64-bit payload-length encoding.
+
+Run `npm test` to build and run the daemon's batching regression tests.
+
 ## Filesystem to Studio
 
 When Studio is connected, files created inside the sync folder are pushed into

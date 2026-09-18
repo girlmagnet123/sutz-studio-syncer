@@ -1,6 +1,10 @@
 export const ClientMessageType = {
   Hello: "hello",
   Snapshot: "snapshot",
+  SnapshotStart: "snapshotStart",
+  SnapshotChunk: "snapshotChunk",
+  SnapshotEnd: "snapshotEnd",
+  MessageChunk: "messageChunk",
   ScriptChanged: "scriptChanged",
   InstanceChanged: "instanceChanged",
   InstanceRemoved: "instanceRemoved",
@@ -10,6 +14,8 @@ export const ClientMessageType = {
 
 export const ServerMessageType = {
   RequestSnapshot: "requestSnapshot",
+  SnapshotAck: "snapshotAck",
+  SnapshotError: "snapshotError",
   PatchScript: "patchScript",
   UpsertScript: "upsertScript",
   ClipboardResult: "clipboardResult",
@@ -29,6 +35,13 @@ export interface StudioInstanceRecord {
 
 export type ClientMessage =
   | {
+      type: typeof ClientMessageType.MessageChunk;
+      messageId: string;
+      sequence: number;
+      total: number;
+      data: string;
+    }
+  | {
       type: typeof ClientMessageType.Hello;
       protocolVersion: number;
       client: string;
@@ -36,6 +49,22 @@ export type ClientMessage =
   | {
       type: typeof ClientMessageType.Snapshot;
       instances: StudioInstanceRecord[];
+    }
+  | {
+      type: typeof ClientMessageType.SnapshotStart;
+      snapshotId: string;
+    }
+  | {
+      type: typeof ClientMessageType.SnapshotChunk;
+      snapshotId: string;
+      sequence: number;
+      instances: StudioInstanceRecord[];
+    }
+  | {
+      type: typeof ClientMessageType.SnapshotEnd;
+      snapshotId: string;
+      chunks: number;
+      instanceCount: number;
     }
   | {
       type: typeof ClientMessageType.ScriptChanged;
@@ -64,6 +93,18 @@ export type ClientMessage =
 export type ServerMessage =
   | {
       type: typeof ServerMessageType.RequestSnapshot;
+      snapshotBatches: true;
+      messageChunks: true;
+    }
+  | {
+      type: typeof ServerMessageType.SnapshotAck;
+      snapshotId: string;
+      sequence: number;
+    }
+  | {
+      type: typeof ServerMessageType.SnapshotError;
+      snapshotId?: string;
+      error: string;
     }
   | {
       type: typeof ServerMessageType.PatchScript;

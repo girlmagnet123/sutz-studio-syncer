@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { constants as bufferConstants } from "node:buffer";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -19,6 +20,21 @@ export interface DaemonOptions {
   portScanCount?: number;
 }
 
+interface PendingSnapshot {
+  socket: WebSocket;
+  id: string;
+  nextSequence: number;
+  instances: Map<string, StudioInstanceRecord>;
+}
+
+interface PendingMessage {
+  socket: WebSocket;
+  id: string;
+  total: number;
+  bytes: number;
+  parts: string[];
+}
+
 export class SutzDaemon {
   private readonly port: number;
   private readonly host: string;
@@ -28,6 +44,8 @@ export class SutzDaemon {
   private socketServer: WebSocketServer | null = null;
   private studioClient: WebSocket | null = null;
   private instances = new Map<string, StudioInstanceRecord>();
+  private pendingSnapshot: PendingSnapshot | null = null;
+  private pendingMessage: PendingMessage | null = null;
   private fileWriter: FileWriter;
   private fileWatcher: fs.FSWatcher | null = null;
   private readonly guidToFilePath = new Map<string, string>();
@@ -79,7 +97,7 @@ export class SutzDaemon {
 
     this.socketServer = new WebSocketServer({
       server: this.httpServer,
-      maxPayload: 0, // no limit test
+      maxPayload: 0, // Snapshot messages are bounded by the plugin's batch size.
     });
 
     this.socketServer.on("connection", (socket) => {
@@ -122,6 +140,8 @@ export class SutzDaemon {
   }
 
   public async stop(): Promise<void> {
+    this.pendingSnapshot = null;
+    this.pendingMessage = null;
     this.send({ type: ServerMessageType.Disconnect });
     this.stopFileWatcher();
 
@@ -155,10 +175,32 @@ export class SutzDaemon {
     console.log("Client connected.");
 
     socket.on("message", (raw) => {
-      this.handleRawMessage(socket, raw.toString());
+      const byteLength = Array.isArray(raw)
+        ? raw.reduce((total, part) => total + part.byteLength, 0)
+        : raw.byteLength;
+      let text: string;
+      try {
+        // Older plugins may still send the entire place as one JSON message.
+        // Reject that message without crashing at Buffer.toString().
+        if (byteLength > bufferConstants.MAX_STRING_LENGTH) {
+          throw new RangeError("Message exceeds Node's single-string limit");
+        }
+        const buffer = Array.isArray(raw)
+          ? Buffer.concat(raw)
+          : raw instanceof ArrayBuffer ? Buffer.from(raw) : raw;
+        text = buffer.toString("utf8");
+      } catch (error) {
+        const reason = `Cannot decode ${byteLength} bytes from Studio. Update the Studio plugin to use batched snapshots.`;
+        console.error(reason, error);
+        this.failSnapshot(socket, undefined, reason);
+        socket.close(1009, "Update Studio plugin: use batched snapshots");
+        return;
+      }
+      this.handleRawMessage(socket, text);
     });
 
     socket.on("close", () => {
+      this.discardSnapshot(socket);
       if (this.studioClient === socket) {
         this.studioClient = null;
         console.log("Studio disconnected.");
@@ -166,6 +208,7 @@ export class SutzDaemon {
     });
 
     socket.on("error", (error) => {
+      this.discardSnapshot(socket);
       this.logSocketError(error);
       if (this.studioClient === socket) {
         this.studioClient = null;
@@ -192,7 +235,7 @@ export class SutzDaemon {
     console.error("Studio socket error:", error);
   }
 
-  private handleRawMessage(socket: WebSocket, raw: string): void {
+  private handleRawMessage(socket: WebSocket, raw: string, allowChunks = true): void {
     let message: ClientMessage;
 
     try {
@@ -202,10 +245,68 @@ export class SutzDaemon {
       return;
     }
 
+    if (!message || typeof message !== "object" || typeof message.type !== "string") {
+      console.warn("Ignored invalid message from Studio.");
+      return;
+    }
+
+    if (message.type === ClientMessageType.MessageChunk) {
+      if (socket !== this.studioClient) return;
+      if (!allowChunks) {
+        this.rejectMessageChunks(socket, "Nested message chunks are not supported.");
+        return;
+      }
+      this.receiveMessageChunk(socket, message);
+      return;
+    }
+    if (this.pendingMessage?.socket === socket) {
+      this.rejectMessageChunks(socket, "An individual message was interrupted before all its chunks arrived.");
+      return;
+    }
     this.handleMessage(socket, message);
   }
 
+  private receiveMessageChunk(socket: WebSocket, message: Extract<ClientMessage, { type: "messageChunk" }>): void {
+    if (typeof message.messageId !== "string" || message.messageId.length === 0 || message.messageId.length > 128
+      || !Number.isSafeInteger(message.sequence) || message.sequence < 0
+      || !Number.isSafeInteger(message.total) || message.total < 1
+      || message.sequence >= message.total || typeof message.data !== "string"
+      || message.data.length === 0 || Buffer.byteLength(message.data, "utf8") > 4096) {
+      this.rejectMessageChunks(socket, "Invalid individual-message chunk.");
+      return;
+    }
+    if (!this.pendingMessage && message.sequence === 0) {
+      this.pendingMessage = { socket, id: message.messageId, total: message.total, bytes: 0, parts: [] };
+    }
+    const pending = this.pendingMessage;
+    if (!pending || pending.socket !== socket || pending.id !== message.messageId
+      || pending.total !== message.total || pending.parts.length !== message.sequence) {
+      this.rejectMessageChunks(socket, "Individual-message chunks arrived out of order.");
+      return;
+    }
+    pending.bytes += Buffer.byteLength(message.data, "utf8");
+    if (pending.bytes > bufferConstants.MAX_STRING_LENGTH) {
+      this.rejectMessageChunks(socket, "One individual script/message exceeds Node's string limit; split that script into modules.");
+      return;
+    }
+    pending.parts.push(message.data);
+    if (pending.parts.length === pending.total) {
+      this.pendingMessage = null;
+      // Only reassemble one individual source/update, never the entire snapshot.
+      this.handleRawMessage(socket, pending.parts.join(""), false);
+    }
+  }
+
+  private rejectMessageChunks(socket: WebSocket, error: string): void {
+    this.failSnapshot(socket, undefined, error);
+    socket.close(1008, "Invalid individual-message chunks");
+  }
+
   private handleMessage(socket: WebSocket, message: ClientMessage): void {
+    if (message.type !== ClientMessageType.Hello && this.studioClient !== socket) {
+      return;
+    }
+
     switch (message.type) {
       case ClientMessageType.Hello:
         if (this.studioClient && this.studioClient !== socket) {
@@ -219,31 +320,79 @@ export class SutzDaemon {
 
         this.studioClient = socket;
         console.log("Studio connected.");
-        this.sendTo(socket, { type: ServerMessageType.RequestSnapshot });
+        this.sendTo(socket, { type: ServerMessageType.RequestSnapshot, snapshotBatches: true, messageChunks: true });
         console.log(
           `Studio hello: ${message.client} protocol v${message.protocolVersion}`,
         );
         break;
 
       case ClientMessageType.Snapshot:
-        this.instances.clear();
-        this.guidToFilePath.clear();
-        this.filePathToGuid.clear();
-        for (const instance of message.instances) {
-          this.instances.set(instance.guid, instance);
+        if (!Array.isArray(message.instances) || !message.instances.every(isInstanceRecord)) {
+          this.failSnapshot(socket, undefined, "Invalid legacy snapshot records.");
+          break;
         }
+        this.discardSnapshot(socket);
+        this.commitSnapshot(new Map(message.instances.map((instance) => [instance.guid, instance])));
+        break;
+
+      case ClientMessageType.SnapshotStart:
+        if (typeof message.snapshotId !== "string" || message.snapshotId.length === 0 || message.snapshotId.length > 128) {
+          this.failSnapshot(socket, undefined, "Invalid snapshot ID.");
+          break;
+        }
+        this.pendingSnapshot = {
+          socket,
+          id: message.snapshotId,
+          nextSequence: 0,
+          instances: new Map(),
+        };
+        this.ackSnapshot(socket, message.snapshotId, -1);
+        break;
+
+      case ClientMessageType.SnapshotChunk:
         {
-          const written = this.fileWriter.writeSnapshot(message.instances);
-          this.indexSyncedScripts(message.instances);
-          const scriptCount = message.instances.filter((instance) => this.isScript(instance)).length;
-          const sourceCount = message.instances.filter((instance) => typeof instance.source === "string").length;
-          if (sourceCount === 0 && scriptCount > 0) {
-            console.log(`Snapshot indexed ${scriptCount} script path(s); waiting for script sources.`);
-          } else {
-            console.log(`Wrote ${written} script file(s) to sync folder.`);
+          const pending = this.pendingSnapshot;
+          if (!pending || pending.socket !== socket || pending.id !== message.snapshotId) {
+            this.failSnapshot(socket, message.snapshotId, "Snapshot chunk has no matching start.");
+            break;
           }
+          if (message.sequence !== pending.nextSequence || !Array.isArray(message.instances)) {
+            this.failSnapshot(socket, message.snapshotId, "Snapshot chunks arrived out of order. Send a new snapshot.");
+            break;
+          }
+          let invalid = false;
+          for (const instance of message.instances) {
+            if (!isInstanceRecord(instance) || pending.instances.has(instance.guid)) {
+              invalid = true;
+              break;
+            }
+            pending.instances.set(instance.guid, instance);
+          }
+          if (invalid) {
+            this.failSnapshot(socket, message.snapshotId, "Snapshot contains an invalid or duplicate instance record.");
+            break;
+          }
+          pending.nextSequence += 1;
+          this.ackSnapshot(socket, pending.id, message.sequence);
         }
-        console.log(`Snapshot received: ${message.instances.length} instances.`);
+        break;
+
+      case ClientMessageType.SnapshotEnd:
+        {
+          const pending = this.pendingSnapshot;
+          if (!pending || pending.socket !== socket || pending.id !== message.snapshotId) {
+            this.failSnapshot(socket, message.snapshotId, "Snapshot end has no matching start.");
+            break;
+          }
+          if (message.chunks !== pending.nextSequence || message.instanceCount !== pending.instances.size) {
+            this.failSnapshot(socket, pending.id, "Incomplete snapshot; existing sync files were kept. Send a new snapshot.");
+            break;
+          }
+          this.pendingSnapshot = null;
+          this.commitSnapshot(pending.instances);
+          this.ackSnapshot(socket, pending.id, message.chunks);
+          console.log(`Snapshot completed in ${message.chunks} batch(es).`);
+        }
         break;
 
       case ClientMessageType.ScriptChanged:
@@ -290,6 +439,47 @@ export class SutzDaemon {
       case ClientMessageType.Pong:
         break;
     }
+  }
+
+  private discardSnapshot(socket: WebSocket): void {
+    if (this.pendingMessage?.socket === socket) {
+      this.pendingMessage = null;
+    }
+    if (this.pendingSnapshot?.socket === socket) {
+      this.pendingSnapshot = null;
+    }
+  }
+
+  private failSnapshot(socket: WebSocket, snapshotId: string | undefined, error: string): void {
+    this.discardSnapshot(socket);
+    console.warn(error);
+    this.sendTo(socket, { type: ServerMessageType.SnapshotError, snapshotId, error });
+  }
+
+  private ackSnapshot(socket: WebSocket, snapshotId: string, sequence: number): void {
+    this.sendTo(socket, { type: ServerMessageType.SnapshotAck, snapshotId, sequence });
+  }
+
+  private commitSnapshot(instances: Map<string, StudioInstanceRecord>): void {
+    // Keep records as objects: never concatenate batches into one giant JSON string.
+    // Pruning happens exactly once, after the complete snapshot has been validated.
+    const written = this.fileWriter.writeSnapshot(instances.values());
+    this.instances = instances;
+    this.guidToFilePath.clear();
+    this.filePathToGuid.clear();
+    let scriptCount = 0;
+    let sourceCount = 0;
+    for (const instance of instances.values()) {
+      this.indexSyncedScript(instance);
+      if (this.isScript(instance)) scriptCount += 1;
+      if (typeof instance.source === "string") sourceCount += 1;
+    }
+    if (sourceCount === 0 && scriptCount > 0) {
+      console.log(`Snapshot indexed ${scriptCount} script path(s); waiting for script sources.`);
+    } else {
+      console.log(`Wrote ${written} script file(s) to sync folder.`);
+    }
+    console.log(`Snapshot received: ${instances.size} instances.`);
   }
 
   private send(message: ServerMessage): boolean {
@@ -440,12 +630,6 @@ export class SutzDaemon {
     console.log(`Sent local script file to Studio: ${scriptFile.path.join("/")}`);
   }
 
-  private indexSyncedScripts(instances: StudioInstanceRecord[]): void {
-    for (const instance of instances) {
-      this.indexSyncedScript(instance);
-    }
-  }
-
   private indexSyncedScript(instance: StudioInstanceRecord, previousFilePath?: string): void {
     if (!this.isScript(instance) || typeof instance.source !== "string") {
       this.forgetSyncedScript(instance.guid);
@@ -510,6 +694,17 @@ export class SutzDaemon {
       });
     }
   }
+}
+
+function isInstanceRecord(value: unknown): value is StudioInstanceRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as StudioInstanceRecord;
+  return typeof record.guid === "string" && record.guid.length > 0
+    && typeof record.className === "string"
+    && typeof record.name === "string"
+    && Array.isArray(record.path) && record.path.length > 0
+    && record.path.every((segment) => typeof segment === "string")
+    && (record.source === undefined || typeof record.source === "string");
 }
 
 interface ClipboardCommand {

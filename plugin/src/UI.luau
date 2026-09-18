@@ -935,9 +935,13 @@ function UI:wire()
 
 	self.snapshotButton.MouseButton1Click:Connect(function()
 		if self.session:isRunning() then
-			self.session:sendSnapshot()
-			self:setStatus("Snapshot sent", COLORS.success)
-			self:addActivity("Snapshot pushed to the local daemon.")
+			self:setStatus("Sending snapshot batches...", COLORS.muted)
+			if self.session:sendSnapshot() then
+				self:setStatus("Snapshot sent", COLORS.success)
+				self:addActivity("Snapshot pushed to the local daemon.")
+			else
+				self:setStatus(self.session.lastError or "Snapshot cancelled", COLORS.danger)
+			end
 			self:switchPage("Output", true)
 		else
 			self:setStatus("Connect before sending a snapshot", COLORS.danger)

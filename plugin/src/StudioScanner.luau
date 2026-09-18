@@ -104,38 +104,56 @@ function StudioScanner.toRecord(instance, includeSource)
 	return record
 end
 
-function StudioScanner.snapshot(includeSource)
-	local records = {}
-	local queue = {}
+-- Visit one record at a time. A depth-first stack releases each parent's child
+-- list when it is done; it never retains a list of every record in the place.
+-- Returning false cancels the walk; "skip" skips an already-visited subtree.
+function StudioScanner.visitInstances(visitor, root)
+	local stack = { { children = if root then { root } else game:GetChildren(), index = 1 } }
+	local visited = 0
 
-	for _, service in ipairs(game:GetChildren()) do
-		if isIncluded(service) then
-			table.insert(queue, service)
+	while #stack > 0 do
+		local frame = stack[#stack]
+		local instance = frame.children[frame.index]
+		if not instance then
+			table.remove(stack)
+			continue
 		end
-	end
+		frame.index += 1
 
-	local index = 1
-	while index <= #queue do
-		local instance = queue[index]
-		local record = StudioScanner.toRecord(instance, includeSource)
-
-		if record then
-			table.insert(records, record)
-		end
-
-		for _, child in ipairs(instance:GetChildren()) do
-			if isIncluded(child) then
-				table.insert(queue, child)
+		if root or isIncluded(instance) then
+			local result = visitor(instance)
+			if result == false then
+				return false
+			end
+			if result ~= "skip" then
+				table.insert(stack, { children = instance:GetChildren(), index = 1 })
 			end
 		end
 
-		if index % 300 == 0 then
+		visited += 1
+		if visited % 300 == 0 then
 			task.wait()
 		end
-
-		index += 1
 	end
 
+	return true
+end
+
+function StudioScanner.visit(includeSource, visitor, root)
+	return StudioScanner.visitInstances(function(instance)
+		local record = StudioScanner.toRecord(instance, includeSource)
+		if record then
+			return visitor(record, instance)
+		end
+		return true
+	end, root)
+end
+
+function StudioScanner.snapshot(includeSource)
+	local records = {}
+	StudioScanner.visit(includeSource, function(record)
+		table.insert(records, record)
+	end)
 	return records
 end
 

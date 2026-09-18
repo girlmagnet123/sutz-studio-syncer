@@ -35,6 +35,9 @@ function SyncSession.new()
 	self.baseUrl = Config.WS_URL
 	self.activityHandlers = {}
 	self.stateHandlers = {}
+	self.snapshotBatches = false
+	self.snapshot = nil
+	self.attachedInstances = {}
 
 	return self
 end
@@ -217,48 +220,284 @@ function SyncSession:indexInstance(instance)
 	return guid
 end
 
-function SyncSession:sendSnapshot()
-	self.guidToInstance = {}
-	self.instanceToGuid = {}
+function SyncSession:isSnapshotCurrent(state)
+	return self.running and self.client == state.client and state.client.connected
+		and self.snapshot == state and not state.cancelled and not state.error
+end
 
-	local snapshot = StudioScanner.snapshot(false)
-	local scripts = {}
+function SyncSession:failSnapshot(state, reason)
+	state.error = tostring(reason)
+	-- A cancelled worker must never close the replacement connection/snapshot.
+	if self.snapshot ~= state or self.client ~= state.client then
+		return false
+	end
+	self.lastError = "Snapshot failed: " .. state.error
+	warn("[Sutz Syncer]", self.lastError)
+	self:emitActivity(self.lastError)
+	-- Closing also discards the daemon's incomplete transaction. It must not
+	-- prune files or accept live edits against a half-received snapshot.
+	self:stop()
+	return false
+end
 
-	for _, record in ipairs(snapshot) do
-		local instance = self:findInstanceByPath(record.path)
-		if instance then
-			self.guidToInstance[record.guid] = instance
-			self.instanceToGuid[instance] = record.guid
-			if StudioScanner.isScript(instance) then
-				table.insert(scripts, instance)
+function SyncSession:sendSnapshotStep(state, sequence, message, encoded)
+	if not self:isSnapshotCurrent(state) then
+		return false, state.error or "Snapshot cancelled."
+	end
+	state.waitingFor = sequence
+	state.acknowledged = false
+	local ok, err, bytes
+	if encoded then
+		ok, err, bytes = state.client:sendEncoded(encoded)
+	else
+		ok, err, bytes = state.client:send(message)
+	end
+	if not ok then
+		return false, err or "Could not send snapshot."
+	end
+	state.totalBytes += bytes or 0
+	debugLog("Snapshot message:", state.id, "sequence", sequence, bytes, "bytes")
+	local deadline = os.clock() + (Config.SNAPSHOT_ACK_TIMEOUT or 30)
+	while self:isSnapshotCurrent(state) and not state.acknowledged do
+		if os.clock() >= deadline then
+			return false, "Daemon did not acknowledge snapshot sequence " .. tostring(sequence)
+				.. ". Rebuild/restart the daemon and reconnect."
+		end
+		task.wait(0.03)
+	end
+	if not self:isSnapshotCurrent(state) then
+		return false, state.error or "Snapshot cancelled."
+	end
+	state.waitingFor = nil
+	return true
+end
+
+function SyncSession:markSnapshotDirty(instance, includeDescendants)
+	local state = self.snapshot
+	if not state then
+		return false
+	end
+	state.dirtyInstances[instance] = true
+	if includeDescendants then
+		state.dirtyRoots[instance] = true
+	end
+	return true
+end
+
+function SyncSession:reconcileSnapshot(state)
+	-- Keep only an instance set, not a copy of every intermediate event/source.
+	-- Events during a yield go into the next pass, which reads the latest state.
+	while next(state.dirtyInstances) or next(state.dirtyRoots) do
+		local dirtyInstances = state.dirtyInstances
+		local dirtyRoots = state.dirtyRoots
+		state.dirtyInstances = {}
+		state.dirtyRoots = {}
+		local sent = {}
+		local count = 0
+		local failure = nil
+		local function reconcile(instance)
+			if not self:isSnapshotCurrent(state) then
+				failure = state.error or "Snapshot cancelled."
+				return false
+			end
+			if sent[instance] then
+				return "skip"
+			end
+			sent[instance] = true
+			local record = StudioScanner.toRecord(instance, true)
+			local message = nil
+			if record then
+				self:indexInstance(instance)
+				message = { type = Protocol.ClientMessage.INSTANCE_CHANGED, instance = record }
+			else
+				local guid = self.instanceToGuid[instance]
+				if guid then
+					message = { type = Protocol.ClientMessage.INSTANCE_REMOVED, guid = guid }
+					self.instanceToGuid[instance] = nil
+					self.guidToInstance[guid] = nil
+				end
+			end
+			if message then
+				local ok, err = state.client:send(message)
+				if not ok then
+					failure = err or "Could not reconcile an instance changed during snapshot."
+					return false
+				end
+			end
+			count += 1
+			if count % 25 == 0 then
+				task.wait()
+			end
+			return true
+		end
+		for root in pairs(dirtyRoots) do
+			if not StudioScanner.visitInstances(reconcile, root) then
+				return false, failure
+			end
+		end
+		for instance in pairs(dirtyInstances) do
+			if not reconcile(instance) then
+				return false, failure
 			end
 		end
 	end
+	return self:isSnapshotCurrent(state), state.error
+end
 
-	self:send({
-		type = Protocol.ClientMessage.SNAPSHOT,
-		instances = snapshot,
-	})
-
-	for index, instance in ipairs(scripts) do
-		local record = StudioScanner.toRecord(instance, true)
-		if record then
-			self:send({
-				type = Protocol.ClientMessage.SCRIPT_CHANGED,
-				guid = record.guid,
-				path = record.path,
-				className = record.className,
-				source = record.source,
-			})
-		end
-
-		if index % 25 == 0 then
-			task.wait()
-		end
+function SyncSession:sendSnapshot()
+	if not self.running or not self.client then
+		return false
+	end
+	if not self.snapshotBatches or not self.client.messageChunks then
+		self.lastError = "This daemon does not support snapshot batches and message fragments. Run npm run build, restart sutz, and reconnect."
+		self:emitActivity(self.lastError)
+		self:stop()
+		return false
 	end
 
-	log("Snapshot sent:", #snapshot, "instances,", #scripts, "scripts")
-	self:emitActivity("Snapshot sent:", #snapshot, "instances,", #scripts, "scripts")
+	if self.snapshot then
+		self.snapshot.cancelled = true
+	end
+	local state = {
+		id = HttpService:GenerateGUID(false),
+		client = self.client,
+		dirtyInstances = {},
+		dirtyRoots = {},
+		totalBytes = 0,
+	}
+	self.snapshot = state
+	local completed, result = pcall(function()
+		local ok, err = self:sendSnapshotStep(state, -1, {
+			type = Protocol.ClientMessage.SNAPSHOT_START,
+			snapshotId = state.id,
+		})
+		if not ok then
+			return self:failSnapshot(state, err)
+		end
+
+		local maxBytes = math.min(Config.SNAPSHOT_MAX_BYTES or 48 * 1024, 48 * 1024)
+		local maxRecords = math.min(Config.SNAPSHOT_MAX_RECORDS or 200, 200)
+		local records = {}
+		local recordBytes = 0
+		local sequence = 0
+		local instanceCount = 0
+		local scripts = {}
+		local seen = {}
+		local prefix = ""
+		local function updatePrefix()
+			local header = HttpService:JSONEncode({
+				type = Protocol.ClientMessage.SNAPSHOT_CHUNK,
+				snapshotId = state.id,
+				sequence = sequence,
+			})
+			prefix = string.sub(header, 1, -2) .. ',"instances":['
+		end
+		updatePrefix()
+		local function flush()
+			if #records == 0 then
+				return true
+			end
+			local encoded = prefix .. table.concat(records, ",") .. "]}"
+			assert(#encoded <= maxBytes, "Snapshot chunk exceeded its byte limit.")
+			local sent, sendError = self:sendSnapshotStep(state, sequence, nil, encoded)
+			if not sent then
+				err = sendError
+				return false
+			end
+			instanceCount += #records
+			sequence += 1
+			records = {}
+			recordBytes = 0
+			updatePrefix()
+			return true
+		end
+
+		local scanned = StudioScanner.visit(false, function(record, instance)
+			if not self:isSnapshotCurrent(state) then
+				err = state.error or "Snapshot cancelled."
+				return false
+			end
+			-- A reparent during traversal can expose the same instance twice.
+			if seen[record.guid] then
+				self:markSnapshotDirty(instance, true)
+				return true
+			end
+			seen[record.guid] = true
+			self.guidToInstance[record.guid] = instance
+			self.instanceToGuid[instance] = record.guid
+			if StudioScanner.isScript(instance) then
+				scripts[instance] = true
+			end
+			local encoded = HttpService:JSONEncode(record)
+			local separatorBytes = if #records > 0 then 1 else 0
+			if #records >= maxRecords or #prefix + recordBytes + separatorBytes + #encoded + 2 > maxBytes then
+				if not flush() then
+					return false
+				end
+			end
+			if #prefix + #encoded + 2 > maxBytes then
+				err = "Instance metadata cannot fit in a 48 KiB snapshot batch: " .. table.concat(record.path, "/")
+					.. " (" .. tostring(#encoded) .. " bytes). Shorten its name/path and retry."
+				return false
+			end
+			if #records > 0 then
+				recordBytes += 1
+			end
+			table.insert(records, encoded)
+			recordBytes += #encoded
+			return true
+		end)
+		if not scanned or not flush() then
+			return self:failSnapshot(state, err or "Snapshot traversal failed.")
+		end
+		ok, err = self:sendSnapshotStep(state, sequence, {
+			type = Protocol.ClientMessage.SNAPSHOT_END,
+			snapshotId = state.id,
+			chunks = sequence,
+			instanceCount = instanceCount,
+		})
+		if not ok then
+			return self:failSnapshot(state, err)
+		end
+
+		local scriptCount = 0
+		for instance in pairs(scripts) do
+			if not self:isSnapshotCurrent(state) then
+				return self:failSnapshot(state, state.error or "Snapshot cancelled.")
+			end
+			local record = StudioScanner.toRecord(instance, true)
+			if record then
+				local sent, sendError, bytes = state.client:send({
+					type = Protocol.ClientMessage.SCRIPT_CHANGED,
+					guid = record.guid,
+					path = record.path,
+					className = record.className,
+					source = record.source,
+				})
+				if not sent then
+					return self:failSnapshot(state, sendError)
+				end
+				scriptCount += 1
+				debugLog("Snapshot script:", table.concat(record.path, "/"), bytes, "bytes")
+			end
+			if scriptCount % 25 == 0 then
+				task.wait()
+			end
+		end
+		ok, err = self:reconcileSnapshot(state)
+		if not ok then
+			return self:failSnapshot(state, err or "Snapshot cancelled.")
+		end
+		self.snapshot = nil
+		log("Snapshot sent:", instanceCount, "instances in", sequence, "batches;", scriptCount, "scripts")
+		self:emitActivity("Snapshot sent:", instanceCount, "instances in", sequence, "batches;", scriptCount,
+			"scripts;", state.totalBytes, "metadata bytes")
+		return true
+	end)
+	if not completed then
+		return self:failSnapshot(state, result)
+	end
+	return result
 end
 
 function SyncSession:findInstanceByPath(path)
@@ -349,6 +588,7 @@ function SyncSession:applyPatch(message)
 	self.applyingPatch = false
 
 	if ok then
+		self:markSnapshotDirty(instance, false)
 		warn(string.format("{Sutz Syncer} Updated: {%s}", instance:GetFullName()))
 		debugLog("Patched script:", instance:GetFullName())
 		self:emitActivity("Patched from file:", instance:GetFullName())
@@ -426,13 +666,23 @@ function SyncSession:upsertScript(message)
 	local record = StudioScanner.toRecord(instance, true)
 	if record then
 		self:indexInstance(instance)
-		self:send({
-			type = Protocol.ClientMessage.SCRIPT_CHANGED,
-			guid = record.guid,
-			path = record.path,
-			className = record.className,
-			source = record.source,
-		})
+		if self:markSnapshotDirty(instance, false) then
+			-- Parent folders can also have been created while patch callbacks were
+			-- suppressed. Reconcile those records after the snapshot commits.
+			local ancestor = instance.Parent
+			while ancestor and ancestor ~= game do
+				self:markSnapshotDirty(ancestor, false)
+				ancestor = ancestor.Parent
+			end
+		else
+			self:send({
+				type = Protocol.ClientMessage.SCRIPT_CHANGED,
+				guid = record.guid,
+				path = record.path,
+				className = record.className,
+				source = record.source,
+			})
+		end
 	end
 
 	local verb = created and "Created from file:" or "Updated from file:"
@@ -440,7 +690,10 @@ function SyncSession:upsertScript(message)
 end
 
 function SyncSession:onStudioScriptChanged(instance)
-	if self.applyingPatch or not self.running then
+	if not self.running then
+		return
+	end
+	if self:markSnapshotDirty(instance, false) or self.applyingPatch then
 		return
 	end
 
@@ -465,7 +718,10 @@ function SyncSession:onStudioScriptChanged(instance)
 end
 
 function SyncSession:onInstanceChanged(instance)
-	if self.applyingPatch or not self.running then
+	if not self.running then
+		return
+	end
+	if self:markSnapshotDirty(instance, true) or self.applyingPatch then
 		return
 	end
 
@@ -483,9 +739,10 @@ function SyncSession:onInstanceChanged(instance)
 end
 
 function SyncSession:attachInstance(instance)
-	if not StudioScanner.isIncluded(instance) then
+	if not StudioScanner.isIncluded(instance) or self.attachedInstances[instance] then
 		return
 	end
+	self.attachedInstances[instance] = true
 
 	self:indexInstance(instance)
 
@@ -507,9 +764,14 @@ function SyncSession:attachInstance(instance)
 end
 
 function SyncSession:attachExistingListeners()
-	for _, descendant in ipairs(game:GetDescendants()) do
-		self:attachInstance(descendant)
-	end
+	local client = self.client
+	StudioScanner.visitInstances(function(instance)
+		if not self.running or self.client ~= client then
+			return false
+		end
+		self:attachInstance(instance)
+		return true
+	end)
 end
 
 function SyncSession:handleMessage(message)
@@ -520,8 +782,27 @@ function SyncSession:handleMessage(message)
 	debugLog("Received:", message.type)
 
 	if message.type == Protocol.ServerMessage.REQUEST_SNAPSHOT then
+		self.snapshotBatches = message.snapshotBatches == true
+		if self.client then
+			self.client.messageChunks = message.messageChunks == true
+		end
 		self:emitActivity("Daemon requested snapshot")
-		self:sendSnapshot()
+		local client = self.client
+		task.spawn(function()
+			if self.client == client then
+				self:sendSnapshot()
+			end
+		end)
+	elseif message.type == Protocol.ServerMessage.SNAPSHOT_ACK then
+		local state = self.snapshot
+		if state and message.snapshotId == state.id and message.sequence == state.waitingFor then
+			state.acknowledged = true
+		end
+	elseif message.type == Protocol.ServerMessage.SNAPSHOT_ERROR then
+		local state = self.snapshot
+		if state and (message.snapshotId == nil or message.snapshotId == state.id) then
+			state.error = tostring(message.error or "Daemon rejected the snapshot.")
+		end
 	elseif message.type == Protocol.ServerMessage.PATCH_SCRIPT then
 		self:applyPatch(message)
 	elseif message.type == Protocol.ServerMessage.UPSERT_SCRIPT then
@@ -568,13 +849,15 @@ function SyncSession:connectToUrl(url)
 			return
 		end
 
-		self:handleMessage(message)
+		if self.client == client then
+			self:handleMessage(message)
+		end
 	end)
 
 	client:onClose(function()
 		if not forwarding then
 			finish(false, "closed")
-		elseif self.running then
+		elseif self.running and self.client == client then
 			log("Daemon connection closed")
 			self.lastError = "Daemon connection closed."
 			self:emitActivity(self.lastError)
@@ -585,7 +868,7 @@ function SyncSession:connectToUrl(url)
 	client:onError(function(err)
 		if not forwarding then
 			finish(false, tostring(err))
-		else
+		elseif self.client == client then
 			warn("[Sutz Syncer] WebSocket error:", err)
 			self.lastError = tostring(err)
 			self:emitActivity("WebSocket error:", tostring(err))
@@ -619,7 +902,9 @@ function SyncSession:connectToUrl(url)
 		finish(false, "timeout")
 	end)
 
-	handshakeEvent.Event:Wait()
+	if not resolved then
+		handshakeEvent.Event:Wait()
+	end
 	handshakeEvent:Destroy()
 
 	if not accepted then
@@ -643,6 +928,7 @@ function SyncSession:start(baseUrl)
 
 	self.lastError = nil
 	self.client = nil
+	self.snapshotBatches = false
 
 	local configuredUrl = self:setBaseUrl(baseUrl or Config.WS_URL)
 	local discoveredUrl, reason = self:discoverFreeUrl(configuredUrl)
@@ -708,7 +994,6 @@ function SyncSession:start(baseUrl)
 	self.connectedUrl = connectedUrl
 	self.running = true
 	self:emitState()
-	self:attachExistingListeners()
 
 	table.insert(self.connections, game.DescendantAdded:Connect(function(instance)
 		self:attachInstance(instance)
@@ -716,15 +1001,33 @@ function SyncSession:start(baseUrl)
 	end))
 
 	table.insert(self.connections, game.DescendantRemoving:Connect(function(instance)
-		local guid = self.instanceToGuid[instance]
-		if guid then
-			self:send({
-				type = Protocol.ClientMessage.INSTANCE_REMOVED,
-				guid = guid,
-			})
-			self:emitActivity("Instance removed:", guid)
+		if self:markSnapshotDirty(instance, true) then
+			return
 		end
+		local client = self.client
+		-- DescendantRemoving runs before Parent has actually changed.
+		task.defer(function()
+			if not self.running or self.client ~= client then
+				return
+			end
+			if self:markSnapshotDirty(instance, true) then
+				return
+			end
+			if StudioScanner.isIncluded(instance) then
+				self:onInstanceChanged(instance)
+				return
+			end
+			local guid = self.instanceToGuid[instance]
+			if guid then
+				if self:send({ type = Protocol.ClientMessage.INSTANCE_REMOVED, guid = guid }) then
+					self:emitActivity("Instance removed:", guid)
+				end
+				self.instanceToGuid[instance] = nil
+				self.guidToInstance[guid] = nil
+			end
+		end)
 	end))
+	self:attachExistingListeners()
 
 	if enableForwarding then
 		enableForwarding()
@@ -732,6 +1035,9 @@ function SyncSession:start(baseUrl)
 
 	for _, message in ipairs(queuedMessages or {}) do
 		self:handleMessage(message)
+	end
+	if not self.running then
+		return false
 	end
 
 	log("Sync started")
@@ -745,6 +1051,11 @@ function SyncSession:stop()
 	end
 
 	self.running = false
+	if self.snapshot then
+		self.snapshot.cancelled = true
+	end
+	self.snapshot = nil
+	self.snapshotBatches = false
 
 	for _, connection in ipairs(self.connections) do
 		connection:Disconnect()
@@ -758,6 +1069,7 @@ function SyncSession:stop()
 	self.client = nil
 	self.guidToInstance = {}
 	self.instanceToGuid = {}
+	self.attachedInstances = {}
 	self.connectedUrl = nil
 
 	log("Sync stopped")

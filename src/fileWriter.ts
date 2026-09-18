@@ -23,7 +23,7 @@ export class FileWriter {
     fs.mkdirSync(this.rootDir, { recursive: true });
   }
 
-  public writeSnapshot(instances: StudioInstanceRecord[]): number {
+  public writeSnapshot(instances: Iterable<StudioInstanceRecord>): number {
     this.ensureRoot();
     this.guidToPath.clear();
 
